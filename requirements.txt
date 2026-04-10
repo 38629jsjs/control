@@ -1,3 +1,5 @@
 telethon
 pyTelegramBotAPI
 psycopg2-binary
+Pillow
+pyzbar
